@@ -1,6 +1,7 @@
 package frag
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -124,10 +125,51 @@ func TestFragUDPMessage(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := FragUDPMessage(tt.args.m, tt.args.maxSize); !reflect.DeepEqual(got, tt.want) {
+			got, err := FragUDPMessage(tt.args.m, tt.args.maxSize)
+			if err != nil {
+				t.Fatalf("FragUDPMessage() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("FragUDPMessage() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFragUDPMessageRejectsUndersizedMaxSize(t *testing.T) {
+	msg := &protocol.UDPMessage{
+		SessionID: 1,
+		PacketID:  1,
+		FragCount: 1,
+		Addr:      "192.0.2.1:443",
+		Data:      []byte("payload-too-large-for-tiny-datagram"),
+	}
+	for _, maxSize := range []int{msg.HeaderSize(), msg.HeaderSize() - 1, 0, -1} {
+		got, err := FragUDPMessage(msg, maxSize)
+		if !errors.Is(err, ErrMaxSizeTooSmall) {
+			t.Fatalf("maxSize=%d: error = %v, want ErrMaxSizeTooSmall", maxSize, err)
+		}
+		if got != nil {
+			t.Fatalf("maxSize=%d: got %d fragments, want nil", maxSize, len(got))
+		}
+	}
+}
+
+func TestFragUDPMessageRejectsTooManyFragments(t *testing.T) {
+	msg := &protocol.UDPMessage{
+		SessionID: 1,
+		PacketID:  1,
+		FragCount: 1,
+		Addr:      "192.0.2.1:443",
+		Data:      make([]byte, 256),
+	}
+	maxSize := msg.HeaderSize() + 1 // 1-byte payloads → 256 fragments
+	got, err := FragUDPMessage(msg, maxSize)
+	if !errors.Is(err, ErrTooManyFragments) {
+		t.Fatalf("error = %v, want ErrTooManyFragments", err)
+	}
+	if got != nil {
+		t.Fatalf("got %d fragments, want nil", len(got))
 	}
 }
 

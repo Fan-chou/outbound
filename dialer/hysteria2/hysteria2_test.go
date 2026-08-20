@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,4 +176,53 @@ func writeTestCAPEM(t *testing.T) (string, *x509.Certificate) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	return caPath, cert
+}
+
+func TestParseHysteria2URLSalamanderRoundTrip(t *testing.T) {
+	link := "hysteria2://user:pass@example.com:443?obfs=salamander&obfs-password=secret#demo"
+	conf, err := ParseHysteria2URL(link)
+	if err != nil {
+		t.Fatalf("ParseHysteria2URL() error = %v", err)
+	}
+	if conf.ObfsPassword != "secret" {
+		t.Fatalf("ObfsPassword = %q, want secret", conf.ObfsPassword)
+	}
+
+	exported := conf.ExportToURL()
+	if !strings.Contains(exported, "obfs=salamander") {
+		t.Fatalf("ExportToURL() = %q, want obfs=salamander", exported)
+	}
+	if !strings.Contains(exported, "obfs-password=secret") {
+		t.Fatalf("ExportToURL() = %q, want obfs-password=secret", exported)
+	}
+
+	roundTrip, err := ParseHysteria2URL(exported)
+	if err != nil {
+		t.Fatalf("ParseHysteria2URL() on exported URL error = %v", err)
+	}
+	if roundTrip.ObfsPassword != conf.ObfsPassword {
+		t.Fatalf("round-trip ObfsPassword = %q, want %q", roundTrip.ObfsPassword, conf.ObfsPassword)
+	}
+
+	_, prop, err := conf.Dialer(&dialer.ExtraOption{}, &noopDialer{})
+	if err != nil {
+		t.Fatalf("Dialer() error = %v", err)
+	}
+	if prop == nil || !strings.Contains(prop.Link, "obfs=salamander") || !strings.Contains(prop.Link, "obfs-password=secret") {
+		t.Fatalf("Dialer property.Link = %v, want salamander obfs fields", prop)
+	}
+}
+
+func TestExportToURLDistinguishesObfsPassword(t *testing.T) {
+	one, err := ParseHysteria2URL("hysteria2://user:pass@example.com:443?obfs=salamander&obfs-password=one")
+	if err != nil {
+		t.Fatalf("ParseHysteria2URL() error = %v", err)
+	}
+	two, err := ParseHysteria2URL("hysteria2://user:pass@example.com:443?obfs=salamander&obfs-password=two")
+	if err != nil {
+		t.Fatalf("ParseHysteria2URL() error = %v", err)
+	}
+	if one.ExportToURL() == two.ExportToURL() {
+		t.Fatalf("nodes that differ only in obfs-password exported identical URL %q", one.ExportToURL())
+	}
 }

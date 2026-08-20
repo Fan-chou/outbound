@@ -221,7 +221,10 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	if errors.As(err, &errTooLarge) {
 		// Message too large, try fragmentation
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
-		fMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDataLen))
+		fMsgs, fragErr := frag.FragUDPMessage(msg, int(errTooLarge.MaxDataLen))
+		if fragErr != nil {
+			return 0, coreErrs.ProtocolError{Message: fragErr.Error()}
+		}
 		for _, fMsg := range fMsgs {
 			err := u.SendFunc(u.SendBuf, &fMsg)
 			if err != nil {

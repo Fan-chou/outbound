@@ -1,18 +1,37 @@
 package frag
 
 import (
+	"errors"
+
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
 )
 
-func FragUDPMessage(m *protocol.UDPMessage, maxSize int) []protocol.UDPMessage {
+var (
+	// ErrMaxSizeTooSmall is returned when maxSize cannot hold a UDPMessage
+	// header plus at least one payload byte. Passing that value into the
+	// fragment loop divides by zero or slices with a negative length.
+	ErrMaxSizeTooSmall = errors.New("max datagram size too small to fragment UDP message")
+	// ErrTooManyFragments is returned when a payload would need more than
+	// the protocol's uint8 FragCount maximum of 255 pieces.
+	ErrTooManyFragments = errors.New("UDP message exceeds maximum fragment count of 255")
+)
+
+func FragUDPMessage(m *protocol.UDPMessage, maxSize int) ([]protocol.UDPMessage, error) {
 	if m.Size() <= maxSize {
-		return []protocol.UDPMessage{*m}
+		return []protocol.UDPMessage{*m}, nil
 	}
 	fullPayload := m.Data
 	maxPayloadSize := maxSize - m.HeaderSize()
+	if maxPayloadSize <= 0 {
+		return nil, ErrMaxSizeTooSmall
+	}
+	n := (len(fullPayload) + maxPayloadSize - 1) / maxPayloadSize
+	if n < 1 || n > 255 {
+		return nil, ErrTooManyFragments
+	}
+	fragCount := uint8(n)
 	off := 0
 	fragID := uint8(0)
-	fragCount := uint8((len(fullPayload) + maxPayloadSize - 1) / maxPayloadSize) // round up
 	frags := make([]protocol.UDPMessage, fragCount)
 	for off < len(fullPayload) {
 		payloadSize := len(fullPayload) - off
@@ -27,7 +46,7 @@ func FragUDPMessage(m *protocol.UDPMessage, maxSize int) []protocol.UDPMessage {
 		off += payloadSize
 		fragID++
 	}
-	return frags
+	return frags, nil
 }
 
 // Defragger handles the defragmentation of UDP messages.

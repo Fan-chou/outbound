@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/netip"
 	"sync"
@@ -9,7 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/olicesx/quic-go"
+
 	"github.com/daeuniverse/outbound/netproxy"
+	coreErrs "github.com/daeuniverse/outbound/protocol/hysteria2/errors"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/frag"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
 )
@@ -387,4 +391,29 @@ func TestUDPSessionManagerQueueAbsorbsModerateBurstWithoutDrop(t *testing.T) {
 	}
 
 	m.closeCleanup()
+}
+
+func TestUDPConnWriteToRejectsUndersizedDatagram(t *testing.T) {
+	u := &udpConn{
+		ID:        1,
+		ReceiveCh: make(chan *protocol.UDPMessage, 1),
+		SendBuf:   make([]byte, protocol.MaxUDPSize),
+		SendFunc: func([]byte, *protocol.UDPMessage) error {
+			return &quic.DatagramTooLargeError{MaxDataLen: 8}
+		},
+		CloseFunc: func() {},
+		target:    "192.0.2.1:443",
+	}
+
+	_, err := u.WriteTo([]byte("payload-larger-than-tiny-peer-datagram"), "192.0.2.1:443")
+	if err == nil {
+		t.Fatal("WriteTo() error = nil, want protocol error")
+	}
+	var protoErr coreErrs.ProtocolError
+	if !errors.As(err, &protoErr) {
+		t.Fatalf("WriteTo() error = %T %v, want ProtocolError", err, err)
+	}
+	if protoErr.Message != frag.ErrMaxSizeTooSmall.Error() {
+		t.Fatalf("ProtocolError.Message = %q, want %q", protoErr.Message, frag.ErrMaxSizeTooSmall.Error())
+	}
 }

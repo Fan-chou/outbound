@@ -153,7 +153,6 @@ func loadCustomRootCAs(caPath string) (*x509.CertPool, error) {
 
 // ref: https://v2.hysteria.network/zh/docs/developers/URI-Scheme/
 func ParseHysteria2URL(link string) (*Hysteria2, error) {
-	// TODO: support salamander obfuscation
 	u, err := url.Parse(link)
 	if err != nil {
 		return nil, err
@@ -268,6 +267,10 @@ func (s *Hysteria2) ExportToURL() string {
 	if s.MaxTx > 0 && s.MaxRx > 0 {
 		q.Set("maxTx", strconv.FormatUint(s.MaxTx, 10))
 		q.Set("maxRx", strconv.FormatUint(s.MaxRx, 10))
+	}
+	if s.ObfsPassword != "" {
+		q.Set("obfs", "salamander")
+		q.Set("obfs-password", s.ObfsPassword)
 	}
 	t.RawQuery = q.Encode()
 	return t.String()

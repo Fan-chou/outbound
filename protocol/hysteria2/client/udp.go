@@ -25,8 +25,9 @@ const (
 	// udpMessageChanSize bounds the per-session receive queue. 128 slots is
 	// enough to absorb bursty game ticks / DNS floods (~512KB of 4KB packets)
 	// while keeping the steady-state channel footprint at 1KB per session
-	// instead of 16KB. QUIC flow control (window-update suppression) provides
-	// backpressure beyond the queue, so no packets are lost.
+	// instead of 16KB. RFC 9221 DATAGRAM has no flow control: a full queue
+	// drops the datagram (and returns its buffer) rather than blocking the
+	// demux worker.
 	udpMessageChanSize = 128
 )
 
@@ -56,8 +57,11 @@ type udpConn struct {
 	// to detect transport death without waiting for ReadFrom/WriteTo errors.
 	transportDone <-chan struct{}
 
-	writeMu    sync.Mutex
-	receiveMu  sync.Mutex
+	writeMu   sync.Mutex
+	receiveMu sync.Mutex
+	// deliverMu serializes RegisterPacketReceiver's drain against feed's
+	// deliver/queue path so queued datagrams stay FIFO with live ones.
+	deliverMu  sync.Mutex
 	muTimer    sync.Mutex
 	timer      *time.Timer
 	target     string
@@ -120,14 +124,6 @@ func (u *udpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 	if handler == nil {
 		return nil, false
 	}
-	u.receiverMu.Lock()
-	if u.receiver != nil {
-		u.receiverMu.Unlock()
-		return nil, false
-	}
-	u.receiver = handler
-	u.receiverMu.Unlock()
-
 	var unregisterOnce sync.Once
 	unregister := func() {
 		unregisterOnce.Do(func() {
@@ -137,6 +133,18 @@ func (u *udpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 		})
 	}
 
+	// Hold deliverMu across the receiver swap and the drain so a concurrent
+	// feed cannot deliver a later packet before the queued prefix.
+	u.deliverMu.Lock()
+	defer u.deliverMu.Unlock()
+	u.receiverMu.Lock()
+	if u.receiver != nil {
+		u.receiverMu.Unlock()
+		return nil, false
+	}
+	u.receiver = handler
+	u.receiverMu.Unlock()
+
 	// Preserve messages that arrived between session creation and registration.
 	for {
 		select {
@@ -145,7 +153,9 @@ func (u *udpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 				unregister()
 				return unregister, true
 			}
-			u.deliverMessage(msg)
+			if !u.deliverMessage(msg) {
+				releaseUDPMessage(msg)
+			}
 		default:
 			return unregister, true
 		}
@@ -184,14 +194,16 @@ func (u *udpConn) queueIfNoReceiver(msg *protocol.UDPMessage) bool {
 	if u.receiver != nil {
 		return false
 	}
+	if u.Closed {
+		releaseUDPMessage(msg)
+		return true
+	}
 	select {
 	case u.ReceiveCh <- msg:
 	default:
 		// Channel full, drop the message. Return the pooled datagram
 		// buffer to quic-go now: nobody will ever consume it.
-		if msg.Release != nil {
-			msg.Release()
-		}
+		releaseUDPMessage(msg)
 	}
 	return true
 }
@@ -199,6 +211,9 @@ func (u *udpConn) queueIfNoReceiver(msg *protocol.UDPMessage) bool {
 func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	u.writeMu.Lock()
 	defer u.writeMu.Unlock()
+	if u.Closed || u.SendBuf == nil {
+		return 0, coreErrs.ClosedError{}
+	}
 
 	// Try no frag first
 	msg := &protocol.UDPMessage{
@@ -297,10 +312,7 @@ type udpSessionManager struct {
 	draining  bool
 	onIdle    func()
 	done      chan struct{}
-	stop      chan struct{}
 	closeOnce sync.Once
-	stopOnce  sync.Once
-	workerWG  sync.WaitGroup
 }
 
 // maxDemuxWorkers caps how many session-affinity workers drain dispatched
@@ -321,7 +333,6 @@ func newUDPSessionManager(io udpIO) *udpSessionManager {
 		m:      make(map[uint32]*udpConn),
 		nextID: 1,
 		done:   make(chan struct{}),
-		stop:   make(chan struct{}),
 	}
 	n := runtime.GOMAXPROCS(0)
 	if n > maxDemuxWorkers {
@@ -346,11 +357,7 @@ func newUDPSessionManager(io udpIO) *udpSessionManager {
 	// by the receiver callback itself, which runs outside receiveMu.
 	go m.routeDemux()
 	for i := range m.workers {
-		m.workerWG.Add(1)
-		go func(index int) {
-			defer m.workerWG.Done()
-			m.demuxWorker(index)
-		}(i)
+		go m.demuxWorker(i)
 	}
 	return m
 }
@@ -360,29 +367,22 @@ func newUDPSessionManager(io udpIO) *udpSessionManager {
 // caller: a second concurrent popper would reintroduce per-session
 // reordering.
 func (m *udpSessionManager) routeDemux() {
-	defer m.closeCleanup()
+	defer m.closeOnce.Do(m.closeCleanup)
 	for {
-		select {
-		case <-m.stop:
-			return
-		case <-m.done:
-			return
-		default:
-		}
 		msg, err := m.io.ReceiveMessage()
 		if err != nil {
 			return
 		}
 		ch := m.workers[msg.SessionID%uint32(len(m.workers))]
-		// Backpressure is still preserved while the transport is alive, but
-		// a closing transport/session must be able to interrupt the send.
-		// Worker channels are never closed: stop/done are the lifecycle
-		// signals, which avoids a send-on-closed-channel race with cleanup.
+		// Blocking dispatch: when a worker falls behind, backpressure
+		// propagates to the transport's bounded receive queue, which owns
+		// the overload drop policy. Dropping here instead would add a
+		// second, less well-sized drop point that fires on bursts the
+		// system could have processed. m.done unblocks a send parked on a
+		// full worker queue when the manager is closed (Close / transport
+		// death) so closeCleanup does not wait on ReceiveMessage.
 		select {
 		case ch <- msg:
-		case <-m.stop:
-			releaseUDPMessage(msg)
-			return
 		case <-m.done:
 			releaseUDPMessage(msg)
 			return
@@ -399,23 +399,17 @@ func (m *udpSessionManager) demuxWorker(index int) {
 		select {
 		case msg := <-ch:
 			m.feed(msg)
-		case <-m.stop:
-			drainUDPMessageQueue(ch)
-			return
 		case <-m.done:
-			drainUDPMessageQueue(ch)
-			return
-		}
-	}
-}
-
-func drainUDPMessageQueue(ch <-chan *protocol.UDPMessage) {
-	for {
-		select {
-		case msg := <-ch:
-			releaseUDPMessage(msg)
-		default:
-			return
+			// Transport is gone: return still-queued buffers to the
+			// pool instead of leaving them for the GC.
+			for {
+				select {
+				case msg := <-ch:
+					releaseUDPMessage(msg)
+				default:
+					return
+				}
+			}
 		}
 	}
 }
@@ -426,22 +420,19 @@ func releaseUDPMessage(msg *protocol.UDPMessage) {
 	}
 }
 
-// signalStop wakes a router blocked on a full worker queue before the
-// underlying QUIC connection is closed. The channel is never closed by a
-// worker or routeDemux, so cleanup cannot race a send.
-func (m *udpSessionManager) signalStop() {
-	if m.stop == nil {
-		return
-	}
-	m.stopOnce.Do(func() { close(m.stop) })
+func (m *udpSessionManager) Close() {
+	m.closeOnce.Do(m.closeCleanup)
 }
 
 func (m *udpSessionManager) closeCleanup() {
-	m.closeOnce.Do(m.cleanup)
-}
-
-func (m *udpSessionManager) cleanup() {
 	m.mutex.Lock()
+	// Close done first so routeDemux can drop a send parked on a full
+	// worker queue instead of waiting for ReceiveMessage to fail.
+	select {
+	case <-m.done:
+	default:
+		close(m.done)
+	}
 	var onIdle func()
 	for _, conn := range m.m {
 		if cb := m.closeLocked(conn); cb != nil {
@@ -453,7 +444,6 @@ func (m *udpSessionManager) cleanup() {
 		m.onIdle = nil
 	}
 	m.closed = true
-	close(m.done)
 	m.mutex.Unlock()
 
 	if onIdle != nil {
@@ -468,11 +458,11 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 	if !ok {
 		// Ignore message from unknown session (e.g. arrived after cleanup).
 		// Return its pooled datagram buffer to quic-go.
-		if msg.Release != nil {
-			msg.Release()
-		}
+		releaseUDPMessage(msg)
 		return
 	}
+	conn.deliverMu.Lock()
+	defer conn.deliverMu.Unlock()
 	if conn.deliverMessage(msg) {
 		return
 	}
@@ -484,6 +474,7 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 		m.mutex.RLock()
 		if current, exists := m.m[msg.SessionID]; !exists || current != conn {
 			m.mutex.RUnlock()
+			releaseUDPMessage(msg)
 			return
 		}
 		if conn.queueIfNoReceiver(msg) {
@@ -553,8 +544,10 @@ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
 	if conn == nil || conn.Closed {
 		return nil
 	}
-	conn.Closed = true
+	// Closed and receiver swap share receiverMu with queueIfNoReceiver so a
+	// send cannot race close(ReceiveCh).
 	conn.receiverMu.Lock()
+	conn.Closed = true
 	conn.receiver = nil
 	conn.receiverMu.Unlock()
 	conn.stopDeadlineTimer()
@@ -566,11 +559,19 @@ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
 	conn.D.Close()
 	conn.receiveMu.Unlock()
 	close(conn.ReceiveCh)
+	for msg := range conn.ReceiveCh {
+		releaseUDPMessage(msg)
+	}
 	delete(m.m, conn.ID)
-	// Return the per-session send buffer to the pool for reuse by the next
-	// session. Buffers are not shared while in use (one per udpConn), so
-	// pooling them here is safe.
-	sendBufPool.Put(conn.SendBuf)
+	// WriteTo holds writeMu around Serialize+SendDatagram. Take it before
+	// returning SendBuf so a concurrent write cannot use-after-put the
+	// serialize buffer.
+	conn.writeMu.Lock()
+	if conn.SendBuf != nil {
+		sendBufPool.Put(conn.SendBuf)
+		conn.SendBuf = nil
+	}
+	conn.writeMu.Unlock()
 	if m.draining && len(m.m) == 0 {
 		onIdle := m.onIdle
 		m.onIdle = nil

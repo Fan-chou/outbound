@@ -66,12 +66,12 @@ type clientImpl struct {
 // session manager before establishing a new connection. Must be called with
 // c.m held.
 func (c *clientImpl) closeExistingLocked() {
-	// Wake the UDP demux before closing the underlying QUIC connection. This
-	// matters when routeDemux is blocked sending to a full worker queue: it
-	// must be able to leave that send and release the message buffers instead
-	// of waiting for another ReceiveDatagram call to observe transport death.
+	// Close the session manager first: this closes m.done so routeDemux can
+	// unblock from a full worker queue instead of waiting for ReceiveMessage
+	// to fail after the QUIC connection is already gone.
 	if c.udpSM != nil {
-		c.udpSM.signalStop()
+		c.udpSM.Close()
+		c.udpSM = nil
 	}
 	if c.conn != nil {
 		_ = c.conn.CloseWithError(closeErrCodeOK, "reconnecting")
@@ -79,10 +79,6 @@ func (c *clientImpl) closeExistingLocked() {
 	if c.pktConn != nil {
 		_ = c.pktConn.Close()
 	}
-	// udpSM demux goroutines will exit when the QUIC connection is closed and
-	// ReceiveDatagram returns an error.  Nil-out the pointer so callers see
-	// UDP as disabled until the next connect() succeeds.
-	c.udpSM = nil
 	c.conn = nil
 	c.pktConn = nil
 }

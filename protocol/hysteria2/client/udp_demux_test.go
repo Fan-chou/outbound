@@ -230,81 +230,87 @@ func TestUDPSessionManagerParallelDemux(t *testing.T) {
 	}
 }
 
-func TestUDPSessionManagerStopsBlockedRouteOnTransportClose(t *testing.T) {
-	const queued = demuxWorkerQueueLen + 2
+func TestUDPSessionManagerCloseUnblocksFullWorkerQueue(t *testing.T) {
 	io := &chanUDPIO{
-		msgs: make(chan *protocol.UDPMessage, queued),
+		// Unbuffered: a send returns only after routeDemux has taken the
+		// datagram, so the extra message below is the one blocked on a
+		// full worker queue rather than sitting in the IO channel.
+		msgs: make(chan *protocol.UDPMessage),
 		dead: make(chan struct{}),
 	}
 	m := newUDPSessionManager(io)
-	connRaw, err := m.NewUDP("192.0.2.1:443")
+	connRaw, err := m.NewUDP("192.0.2.8:443")
 	if err != nil {
-		t.Fatalf("NewUDP() error = %v", err)
+		t.Fatalf("NewUDP: %v", err)
 	}
-	conn := connRaw.(*udpConn)
+	u := connRaw.(*udpConn)
 
-	started := make(chan struct{})
-	releaseHandler := make(chan struct{})
-	var released atomic.Int32
-	_, ok := conn.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
-		close(started)
-		<-releaseHandler
+	hold := make(chan struct{})
+	entered := make(chan struct{})
+	_, ok := u.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-hold
 		packet.Release()
 		return true
 	})
 	if !ok {
-		t.Fatal("RegisterPacketReceiver() failed")
+		t.Fatal("expected packet receiver registration")
 	}
 
-	for i := 0; i < queued; i++ {
-		io.msgs <- &protocol.UDPMessage{
-			SessionID: conn.ID,
-			PacketID:  uint16(i + 1),
-			FragID:    0,
-			FragCount: 1,
-			Addr:      "192.0.2.1:443",
-			Data:      []byte{byte(i)},
-			Release:   func() { released.Add(1) },
-		}
-	}
-
+	io.msgs <- &protocol.UDPMessage{SessionID: u.ID, FragCount: 1, Data: []byte{0}}
 	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("worker did not start blocking handler")
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not take the first datagram")
 	}
-	worker := m.workers[conn.ID%uint32(len(m.workers))]
-	deadline := time.Now().Add(time.Second)
-	for len(worker) != demuxWorkerQueueLen && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := len(worker); got != demuxWorkerQueueLen {
-		t.Fatalf("worker queue length = %d, want full queue length %d", got, demuxWorkerQueueLen)
-	}
-
-	// routeDemux is now blocked on the next worker send. The stop signal must
-	// interrupt that send and let cleanup close the manager without waiting for
-	// another ReceiveMessage result.
-	m.signalStop()
-	select {
-	case <-m.done:
-	case <-time.After(time.Second):
-		t.Fatal("manager did not close while route was blocked on a full queue")
-	}
-	close(releaseHandler)
-	m.workerWG.Wait()
-
-	// The fake transport still owns any datagrams that routeDemux did not pop;
-	// release them to model the transport discarding its receive queue.
-	for {
+	for i := 0; i < demuxWorkerQueueLen; i++ {
 		select {
-		case msg := <-io.msgs:
-			releaseUDPMessage(msg)
-		default:
-			if got := released.Load(); got != queued {
-				t.Fatalf("released datagrams = %d, want %d", got, queued)
-			}
-			return
+		case io.msgs <- &protocol.UDPMessage{SessionID: u.ID, FragCount: 1, Data: []byte{byte(i + 1)}}:
+		case <-time.After(2 * time.Second):
+			t.Fatal("could not fill the worker queue")
 		}
+	}
+
+	var released atomic.Int32
+	parked := &protocol.UDPMessage{
+		SessionID: u.ID,
+		FragCount: 1,
+		Data:      []byte{255},
+		Release:   func() { released.Add(1) },
+	}
+	parkedSent := make(chan struct{})
+	go func() {
+		io.msgs <- parked
+		close(parkedSent)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		m.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked on a full worker queue")
+	}
+	select {
+	case <-parkedSent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("router stayed blocked on the parked datagram")
+	}
+	close(hold)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for released.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("parked datagram Release calls = %d, want 1", released.Load())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

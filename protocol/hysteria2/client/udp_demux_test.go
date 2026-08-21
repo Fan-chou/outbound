@@ -229,3 +229,82 @@ func TestUDPSessionManagerParallelDemux(t *testing.T) {
 		}
 	}
 }
+
+func TestUDPSessionManagerStopsBlockedRouteOnTransportClose(t *testing.T) {
+	const queued = demuxWorkerQueueLen + 2
+	io := &chanUDPIO{
+		msgs: make(chan *protocol.UDPMessage, queued),
+		dead: make(chan struct{}),
+	}
+	m := newUDPSessionManager(io)
+	connRaw, err := m.NewUDP("192.0.2.1:443")
+	if err != nil {
+		t.Fatalf("NewUDP() error = %v", err)
+	}
+	conn := connRaw.(*udpConn)
+
+	started := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var released atomic.Int32
+	_, ok := conn.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+		close(started)
+		<-releaseHandler
+		packet.Release()
+		return true
+	})
+	if !ok {
+		t.Fatal("RegisterPacketReceiver() failed")
+	}
+
+	for i := 0; i < queued; i++ {
+		io.msgs <- &protocol.UDPMessage{
+			SessionID: conn.ID,
+			PacketID:  uint16(i + 1),
+			FragID:    0,
+			FragCount: 1,
+			Addr:      "192.0.2.1:443",
+			Data:      []byte{byte(i)},
+			Release:   func() { released.Add(1) },
+		}
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start blocking handler")
+	}
+	worker := m.workers[conn.ID%uint32(len(m.workers))]
+	deadline := time.Now().Add(time.Second)
+	for len(worker) != demuxWorkerQueueLen && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(worker); got != demuxWorkerQueueLen {
+		t.Fatalf("worker queue length = %d, want full queue length %d", got, demuxWorkerQueueLen)
+	}
+
+	// routeDemux is now blocked on the next worker send. The stop signal must
+	// interrupt that send and let cleanup close the manager without waiting for
+	// another ReceiveMessage result.
+	m.signalStop()
+	select {
+	case <-m.done:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not close while route was blocked on a full queue")
+	}
+	close(releaseHandler)
+	m.workerWG.Wait()
+
+	// The fake transport still owns any datagrams that routeDemux did not pop;
+	// release them to model the transport discarding its receive queue.
+	for {
+		select {
+		case msg := <-io.msgs:
+			releaseUDPMessage(msg)
+		default:
+			if got := released.Load(); got != queued {
+				t.Fatalf("released datagrams = %d, want %d", got, queued)
+			}
+			return
+		}
+	}
+}

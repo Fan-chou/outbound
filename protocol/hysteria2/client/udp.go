@@ -297,7 +297,10 @@ type udpSessionManager struct {
 	draining  bool
 	onIdle    func()
 	done      chan struct{}
+	stop      chan struct{}
 	closeOnce sync.Once
+	stopOnce  sync.Once
+	workerWG  sync.WaitGroup
 }
 
 // maxDemuxWorkers caps how many session-affinity workers drain dispatched
@@ -318,6 +321,7 @@ func newUDPSessionManager(io udpIO) *udpSessionManager {
 		m:      make(map[uint32]*udpConn),
 		nextID: 1,
 		done:   make(chan struct{}),
+		stop:   make(chan struct{}),
 	}
 	n := runtime.GOMAXPROCS(0)
 	if n > maxDemuxWorkers {
@@ -342,7 +346,11 @@ func newUDPSessionManager(io udpIO) *udpSessionManager {
 	// by the receiver callback itself, which runs outside receiveMu.
 	go m.routeDemux()
 	for i := range m.workers {
-		go m.demuxWorker(i)
+		m.workerWG.Add(1)
+		go func(index int) {
+			defer m.workerWG.Done()
+			m.demuxWorker(index)
+		}(i)
 	}
 	return m
 }
@@ -352,19 +360,33 @@ func newUDPSessionManager(io udpIO) *udpSessionManager {
 // caller: a second concurrent popper would reintroduce per-session
 // reordering.
 func (m *udpSessionManager) routeDemux() {
-	defer m.closeOnce.Do(m.closeCleanup)
+	defer m.closeCleanup()
 	for {
+		select {
+		case <-m.stop:
+			return
+		case <-m.done:
+			return
+		default:
+		}
 		msg, err := m.io.ReceiveMessage()
 		if err != nil {
 			return
 		}
 		ch := m.workers[msg.SessionID%uint32(len(m.workers))]
-		// Blocking dispatch: when a worker falls behind, backpressure
-		// propagates to the transport's bounded receive queue, which owns
-		// the overload drop policy. Dropping here instead would add a
-		// second, less well-sized drop point that fires on bursts the
-		// system could have processed.
-		ch <- msg
+		// Backpressure is still preserved while the transport is alive, but
+		// a closing transport/session must be able to interrupt the send.
+		// Worker channels are never closed: stop/done are the lifecycle
+		// signals, which avoids a send-on-closed-channel race with cleanup.
+		select {
+		case ch <- msg:
+		case <-m.stop:
+			releaseUDPMessage(msg)
+			return
+		case <-m.done:
+			releaseUDPMessage(msg)
+			return
+		}
 	}
 }
 
@@ -377,17 +399,23 @@ func (m *udpSessionManager) demuxWorker(index int) {
 		select {
 		case msg := <-ch:
 			m.feed(msg)
+		case <-m.stop:
+			drainUDPMessageQueue(ch)
+			return
 		case <-m.done:
-			// Transport is gone: return still-queued buffers to the
-			// pool instead of leaving them for the GC.
-			for {
-				select {
-				case msg := <-ch:
-					releaseUDPMessage(msg)
-				default:
-					return
-				}
-			}
+			drainUDPMessageQueue(ch)
+			return
+		}
+	}
+}
+
+func drainUDPMessageQueue(ch <-chan *protocol.UDPMessage) {
+	for {
+		select {
+		case msg := <-ch:
+			releaseUDPMessage(msg)
+		default:
+			return
 		}
 	}
 }
@@ -398,7 +426,21 @@ func releaseUDPMessage(msg *protocol.UDPMessage) {
 	}
 }
 
+// signalStop wakes a router blocked on a full worker queue before the
+// underlying QUIC connection is closed. The channel is never closed by a
+// worker or routeDemux, so cleanup cannot race a send.
+func (m *udpSessionManager) signalStop() {
+	if m.stop == nil {
+		return
+	}
+	m.stopOnce.Do(func() { close(m.stop) })
+}
+
 func (m *udpSessionManager) closeCleanup() {
+	m.closeOnce.Do(m.cleanup)
+}
+
+func (m *udpSessionManager) cleanup() {
 	m.mutex.Lock()
 	var onIdle func()
 	for _, conn := range m.m {

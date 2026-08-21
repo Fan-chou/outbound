@@ -1,9 +1,12 @@
 package frag
 
 import (
+	"bytes"
 	"errors"
 	"reflect"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
 )
@@ -361,7 +364,7 @@ func TestDefragger(t *testing.T) {
 				FragID:    0,
 				FragCount: 1,
 				Addr:      "test:123",
-				Data:      []byte("shinsekai annaijo"),
+				Data:      []byte("shinsekai" + "shinsekai"),
 			},
 		},
 	}
@@ -375,4 +378,153 @@ func TestDefragger(t *testing.T) {
 			}
 		})
 	}
+}
+
+func fragmentMessage(sessionID uint32, packetID uint16, fragID, fragCount uint8, data string) *protocol.UDPMessage {
+	return &protocol.UDPMessage{
+		SessionID: sessionID,
+		PacketID:  packetID,
+		FragID:    fragID,
+		FragCount: fragCount,
+		Addr:      "192.0.2.1:443",
+		Data:      []byte(data),
+	}
+}
+
+func TestDefraggerInterleavesPacketIDs(t *testing.T) {
+	d := NewDefragger()
+	a1 := fragmentMessage(1, 100, 0, 2, "A1")
+	b1 := fragmentMessage(1, 200, 0, 2, "B1")
+	a2 := fragmentMessage(1, 100, 1, 2, "A2")
+	b2 := fragmentMessage(1, 200, 1, 2, "B2")
+
+	if got := d.Feed(a1); got != nil {
+		t.Fatalf("A1 = %v, want incomplete", got)
+	}
+	if got := d.Feed(b1); got != nil {
+		t.Fatalf("B1 = %v, want incomplete", got)
+	}
+	if got := d.Feed(a2); got == nil || !bytes.Equal(got.Data, []byte("A1A2")) {
+		t.Fatalf("A2 = %v, want A1A2", got)
+	}
+	if got := d.Feed(b2); got == nil || !bytes.Equal(got.Data, []byte("B1B2")) {
+		t.Fatalf("B2 = %v, want B1B2", got)
+	}
+	d.Close()
+}
+
+func TestDefraggerOutOfOrderFragments(t *testing.T) {
+	d := NewDefragger()
+	for _, msg := range []*protocol.UDPMessage{
+		fragmentMessage(1, 300, 2, 3, "C"),
+		fragmentMessage(1, 300, 0, 3, "A"),
+	} {
+		if got := d.Feed(msg); got != nil {
+			t.Fatalf("partial out-of-order feed = %v, want incomplete", got)
+		}
+	}
+	got := d.Feed(fragmentMessage(1, 300, 1, 3, "B"))
+	if got == nil || !bytes.Equal(got.Data, []byte("ABC")) {
+		t.Fatalf("out-of-order completion = %v, want ABC", got)
+	}
+	d.Close()
+}
+
+func TestDefraggerRejectsInvalidFragmentsAndReleases(t *testing.T) {
+	var released atomic.Int32
+	tracked := func(m *protocol.UDPMessage) *protocol.UDPMessage {
+		m.Release = func() { released.Add(1) }
+		return m
+	}
+	d := NewDefragger()
+	invalid := []*protocol.UDPMessage{
+		tracked(fragmentMessage(1, 1, 0, 0, "invalid-count")),
+		tracked(fragmentMessage(1, 2, 2, 2, "invalid-index")),
+	}
+	for _, msg := range invalid {
+		if got := d.Feed(msg); got != nil {
+			t.Fatalf("invalid fragment produced %v", got)
+		}
+	}
+
+	if got := d.Feed(tracked(fragmentMessage(1, 3, 0, 2, "first"))); got != nil {
+		t.Fatalf("first fragment = %v, want incomplete", got)
+	}
+	if got := d.Feed(tracked(fragmentMessage(1, 3, 0, 2, "duplicate"))); got != nil {
+		t.Fatalf("duplicate fragment = %v, want nil", got)
+	}
+	if got := d.Feed(tracked(fragmentMessage(1, 3, 1, 3, "mismatched-count"))); got != nil {
+		t.Fatalf("mismatched fragment = %v, want nil", got)
+	}
+	d.Close()
+	if got := released.Load(); got != 5 {
+		t.Fatalf("release count = %d, want 5 (2 invalid + duplicate + mismatch + pending)", got)
+	}
+}
+
+func TestDefraggerTTLAndResourceLimits(t *testing.T) {
+	var expired atomic.Int32
+	d := NewDefragger(DefraggerConfig{FragmentTTL: 20 * time.Millisecond})
+	msg := fragmentMessage(1, 10, 0, 2, "expired")
+	msg.Release = func() { expired.Add(1) }
+	d.Feed(msg)
+	deadline := time.Now().Add(time.Second)
+	for expired.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if expired.Load() != 1 {
+		t.Fatalf("expired release count = %d, want 1", expired.Load())
+	}
+	d.mu.Lock()
+	pending := len(d.packets)
+	d.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending packets after TTL = %d, want 0", pending)
+	}
+	d.Close()
+
+	var capped atomic.Int32
+	track := func(m *protocol.UDPMessage) *protocol.UDPMessage {
+		m.Release = func() { capped.Add(1) }
+		return m
+	}
+	ids := NewDefragger(DefraggerConfig{
+		MaxPacketIDs:   1,
+		MaxPacketSize:  8,
+		MaxMemoryBytes: 8,
+	})
+	ids.Feed(track(fragmentMessage(1, 20, 0, 2, "aa")))
+	if got := ids.Feed(track(fragmentMessage(1, 21, 0, 2, "bb"))); got != nil {
+		t.Fatalf("packet beyond ID cap = %v, want nil", got)
+	}
+	if got := ids.Feed(track(fragmentMessage(1, 20, 1, 2, "cc"))); got == nil {
+		t.Fatal("packet at ID cap did not complete")
+	}
+	if capped.Load() != 3 {
+		t.Fatalf("ID cap release count = %d, want 3", capped.Load())
+	}
+	ids.Close()
+
+	var bounded atomic.Int32
+	memory := NewDefragger(DefraggerConfig{
+		MaxPacketIDs:   4,
+		MaxPacketSize:  3,
+		MaxMemoryBytes: 3,
+	})
+	memory.Feed(trackWithCounter(fragmentMessage(1, 30, 0, 2, "ab"), &bounded))
+	if got := memory.Feed(trackWithCounter(fragmentMessage(1, 31, 0, 2, "cd"), &bounded)); got != nil {
+		t.Fatalf("packet beyond memory cap = %v, want nil", got)
+	}
+	if got := memory.Feed(trackWithCounter(fragmentMessage(1, 30, 1, 2, "cd"), &bounded)); got != nil {
+		t.Fatalf("oversized completion = %v, want nil", got)
+	}
+	memory.Close()
+	if bounded.Load() != 3 {
+		t.Fatalf("memory/packet limit release count = %d, want 3", bounded.Load())
+	}
+}
+
+func trackWithCounter(m *protocol.UDPMessage, counter *atomic.Int32) *protocol.UDPMessage {
+	m.Release = func() { counter.Add(1) }
+	return m
 }

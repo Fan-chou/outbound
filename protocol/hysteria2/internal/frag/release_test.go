@@ -69,10 +69,10 @@ func TestDefraggerReleaseExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestDefraggerReleaseOnSupercede verifies that when a new fragmented message
-// arrives before the previous one is complete, the superseded fragments are
-// released (not leaked).
-func TestDefraggerReleaseOnSupercede(t *testing.T) {
+// TestDefraggerReleaseOnInterleave verifies that a new PacketID does not
+// discard an incomplete packet, and that both packet lifecycles release their
+// pooled buffers exactly once.
+func TestDefraggerReleaseOnInterleave(t *testing.T) {
 	var released atomic.Int32
 	d := &Defragger{}
 
@@ -91,14 +91,30 @@ func TestDefraggerReleaseOnSupercede(t *testing.T) {
 		t.Fatalf("releases before supercede = %d, want 0", released.Load())
 	}
 
-	// New packet ID supersedes the incomplete message: old fragments released.
+	// A different PacketID is allowed to remain in flight concurrently.
 	new1 := releaseTrackingMessage(&protocol.UDPMessage{
 		SessionID: 7, PacketID: 2, FragID: 0, FragCount: 2,
 		Addr: "1.2.3.4:5", Data: []byte("xx"),
 	}, &released)
 	d.Feed(new1)
-	if released.Load() != 2 {
-		t.Fatalf("releases after supercede = %d, want 2 (old1+old2)", released.Load())
+	if released.Load() != 0 {
+		t.Fatalf("releases after interleave = %d, want 0", released.Load())
+	}
+
+	old3 := releaseTrackingMessage(&protocol.UDPMessage{
+		SessionID: 7, PacketID: 1, FragID: 2, FragCount: 3,
+		Addr: "1.2.3.4:5", Data: []byte("ccc"),
+	}, &released)
+	if got := d.Feed(old3); got == nil {
+		t.Fatal("interleaved packet did not complete")
+	}
+	if released.Load() != 3 {
+		t.Fatalf("releases after completion = %d, want 3 (old1+old2+old3)", released.Load())
+	}
+
+	d.Close()
+	if released.Load() != 4 {
+		t.Fatalf("releases after close = %d, want 4 (including new1)", released.Load())
 	}
 }
 

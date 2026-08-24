@@ -61,13 +61,13 @@ type udpConn struct {
 	receiveMu sync.Mutex
 	// deliverMu serializes RegisterPacketReceiver's drain against feed's
 	// deliver/queue path so queued datagrams stay FIFO with live ones.
-	deliverMu  sync.Mutex
-	muTimer    sync.Mutex
-	timer      *time.Timer
-	target     string
-	targetAddr netip.AddrPort // parsed once at session creation
-	receiverMu sync.Mutex
-	receiver   netproxy.PacketReceiveHandler
+	deliverMu         sync.Mutex
+	muTimer           sync.Mutex
+	timer             *time.Timer
+	target            string
+	defaultTargetAddr netip.AddrPort // validated at session creation; replies may differ
+	receiverMu        sync.Mutex
+	receiver          netproxy.PacketReceiveHandler
 }
 
 var _ netproxy.PacketReceiver = (*udpConn)(nil)
@@ -106,15 +106,26 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 			// Incomplete message, wait for more
 			continue
 		}
-		// The session is bound to a single target address, so the parsed
-		// AddrPort cached at creation time applies to every datagram on this
-		// session - no per-datagram ParseAddrPort needed.
-		n := copy(p, dfMsg.Data)
-		if dfMsg.Release != nil {
-			dfMsg.Release()
+		from, err := u.addrForMessage(dfMsg.Addr)
+		if err != nil {
+			releaseUDPMessage(dfMsg)
+			return 0, netip.AddrPort{}, err
 		}
-		return n, u.targetAddr, nil
+		n := copy(p, dfMsg.Data)
+		releaseUDPMessage(dfMsg)
+		return n, from, nil
 	}
+}
+
+// addrForMessage returns the datagram's peer. WriteTo may send to other
+// targets (dae FullCone), and each reply carries the actual peer in
+// UDPMessage.Addr. The session default is cached to keep the common path
+// allocation-free; only a different spelling or peer pays ParseAddrPort.
+func (u *udpConn) addrForMessage(addr string) (netip.AddrPort, error) {
+	if addr == u.target {
+		return u.defaultTargetAddr, nil
+	}
+	return netip.ParseAddrPort(addr)
 }
 
 // RegisterPacketReceiver lets dae consume packets from the session manager's
@@ -175,10 +186,12 @@ func (u *udpConn) deliverMessage(msg *protocol.UDPMessage) bool {
 	if msg == nil {
 		return true
 	}
-	// Session target is constant; use the cached AddrPort instead of
-	// re-parsing msg.Addr on every datagram. The release callback (if any)
-	// returns the pooled datagram buffer once the consumer is done with it.
-	packet := netproxy.NewReceivedPacket(msg.Data, u.targetAddr, nil, msg.Release)
+	from, err := u.addrForMessage(msg.Addr)
+	if err != nil {
+		releaseUDPMessage(msg)
+		return true
+	}
+	packet := netproxy.NewReceivedPacket(msg.Data, from, nil, msg.Release)
 	if handler(packet) {
 		return true
 	}
@@ -500,11 +513,9 @@ func (m *udpSessionManager) NewUDP(addr string) (netproxy.Conn, error) {
 	id := m.nextID
 	m.nextID++
 
-	// Parse the session target once at creation. A hy2 UDP session is bound
-	// to a single target address, so the parsed AddrPort is constant for the
-	// session lifetime and can be handed to consumers directly, avoiding a
-	// per-datagram ParseAddrPort on the receive hot path.
-	targetAddr, err := netip.ParseAddrPort(addr)
+	// Validate the default target at session creation. WriteTo may send to
+	// other targets, and each reply carries its actual peer in UDPMessage.Addr.
+	defaultTargetAddr, err := netip.ParseAddrPort(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -517,10 +528,10 @@ func (m *udpSessionManager) NewUDP(addr string) (netproxy.Conn, error) {
 		SendFunc:      m.io.SendMessage,
 		transportDone: m.done,
 
-		writeMu:    sync.Mutex{},
-		muTimer:    sync.Mutex{},
-		target:     addr,
-		targetAddr: targetAddr,
+		writeMu:           sync.Mutex{},
+		muTimer:           sync.Mutex{},
+		target:            addr,
+		defaultTargetAddr: defaultTargetAddr,
 	}
 	conn.CloseFunc = func() {
 		m.close(conn)

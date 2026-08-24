@@ -91,20 +91,217 @@ func TestUDPConnWriteToSerializesSendFunc(t *testing.T) {
 	}
 }
 
-func TestUDPConnPacketReceiverDrainsQueuedMessage(t *testing.T) {
+func TestUDPConnReadFromReportsPerDatagramMessageAddress(t *testing.T) {
 	targetAddr := netip.MustParseAddrPort("192.0.2.10:5353")
+	messageAddrs := []netip.AddrPort{
+		netip.MustParseAddrPort("198.51.100.8:443"),
+		netip.MustParseAddrPort("203.0.113.9:8443"),
+	}
+	var released atomic.Int32
 	u := &udpConn{
-		ID:         1,
-		D:          &frag.Defragger{},
-		ReceiveCh:  make(chan *protocol.UDPMessage, 2),
-		target:     targetAddr.String(),
-		targetAddr: targetAddr,
+		ID:                1,
+		D:                 &frag.Defragger{},
+		ReceiveCh:         make(chan *protocol.UDPMessage, len(messageAddrs)),
+		target:            targetAddr.String(),
+		defaultTargetAddr: targetAddr,
+	}
+	for _, messageAddr := range messageAddrs {
+		u.ReceiveCh <- &protocol.UDPMessage{
+			SessionID: 1,
+			FragCount: 1,
+			Addr:      messageAddr.String(),
+			Data:      []byte(messageAddr.String()),
+			Release:   func() { released.Add(1) },
+		}
+	}
+
+	buf := make([]byte, 64)
+	for _, want := range messageAddrs {
+		n, from, err := u.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom() error = %v", err)
+		}
+		if got := string(buf[:n]); got != want.String() {
+			t.Fatalf("ReadFrom() data = %q, want %q", got, want)
+		}
+		if from != want {
+			t.Fatalf("ReadFrom() address = %v, want message address %v", from, want)
+		}
+	}
+	if got, want := released.Load(), int32(len(messageAddrs)); got != want {
+		t.Fatalf("Release calls = %d, want %d", got, want)
+	}
+}
+
+func TestUDPConnReadFromMalformedAddressReleasesMessage(t *testing.T) {
+	targetAddr := netip.MustParseAddrPort("192.0.2.10:5353")
+	var released atomic.Int32
+	u := &udpConn{
+		ID:                1,
+		D:                 &frag.Defragger{},
+		ReceiveCh:         make(chan *protocol.UDPMessage, 1),
+		target:            targetAddr.String(),
+		defaultTargetAddr: targetAddr,
 	}
 	u.ReceiveCh <- &protocol.UDPMessage{
 		SessionID: 1,
 		FragCount: 1,
-		Addr:      "192.0.2.10:5353",
+		Addr:      "not-an-addr-port",
+		Data:      []byte("malformed"),
+		Release:   func() { released.Add(1) },
+	}
+
+	n, from, err := u.ReadFrom(make([]byte, 64))
+	if err == nil {
+		t.Fatal("ReadFrom() error = nil, want address parse error")
+	}
+	if n != 0 || from.IsValid() {
+		t.Fatalf("ReadFrom() = (%d, %v), want zero values on malformed address", n, from)
+	}
+	if got := released.Load(); got != 1 {
+		t.Fatalf("Release calls = %d, want 1", got)
+	}
+}
+
+func TestUDPConnMessageAddrUsesDefaultCacheAndPerDatagramFallback(t *testing.T) {
+	m := &udpSessionManager{
+		io:     noopUDPTestIO{},
+		m:      make(map[uint32]*udpConn),
+		nextID: 1,
+		done:   make(chan struct{}),
+	}
+	const target = "[2001:db8::1]:443"
+	connRaw, err := m.NewUDP(target)
+	if err != nil {
+		t.Fatalf("NewUDP() error = %v", err)
+	}
+	u := connRaw.(*udpConn)
+	defer m.close(u)
+
+	tests := []struct {
+		name    string
+		addr    string
+		want    netip.AddrPort
+		wantErr bool
+	}{
+		{
+			name: "cached default target",
+			addr: target,
+			want: netip.MustParseAddrPort(target),
+		},
+		{
+			name: "equivalent target spelling",
+			addr: "[2001:db8:0:0:0:0:0:1]:443",
+			want: netip.MustParseAddrPort(target),
+		},
+		{
+			name: "alternate peer",
+			addr: "198.51.100.8:8443",
+			want: netip.MustParseAddrPort("198.51.100.8:8443"),
+		},
+		{
+			name: "cached default after alternate peer",
+			addr: target,
+			want: netip.MustParseAddrPort(target),
+		},
+		{
+			name:    "malformed peer",
+			addr:    "not-an-addr-port",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := u.addrForMessage(tt.addr)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("addrForMessage() error = nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("addrForMessage() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("addrForMessage() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUDPConnReassembledPacketPreservesDefaultAddressAndRelease(t *testing.T) {
+	m := &udpSessionManager{
+		io:     noopUDPTestIO{},
+		m:      make(map[uint32]*udpConn),
+		nextID: 1,
+		done:   make(chan struct{}),
+	}
+	const target = "192.0.2.10:5353"
+	connRaw, err := m.NewUDP(target)
+	if err != nil {
+		t.Fatalf("NewUDP() error = %v", err)
+	}
+	u := connRaw.(*udpConn)
+	defer m.close(u)
+
+	type received struct {
+		data []byte
+		from netip.AddrPort
+	}
+	receivedCh := make(chan received, 1)
+	if _, ok := u.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+		receivedCh <- received{data: append([]byte(nil), packet.Data...), from: packet.From}
+		packet.Release()
+		return true
+	}); !ok {
+		t.Fatal("RegisterPacketReceiver() = false")
+	}
+
+	var released atomic.Int32
+	for fragID, data := range [][]byte{[]byte("hello "), []byte("world")} {
+		if !u.deliverMessage(&protocol.UDPMessage{
+			SessionID: u.ID,
+			PacketID:  7,
+			FragID:    uint8(fragID),
+			FragCount: 2,
+			Addr:      target,
+			Data:      data,
+			Release:   func() { released.Add(1) },
+		}) {
+			t.Fatalf("deliverMessage(fragment %d) = false", fragID)
+		}
+	}
+
+	got := <-receivedCh
+	if string(got.data) != "hello world" {
+		t.Fatalf("reassembled data = %q, want %q", got.data, "hello world")
+	}
+	if want := netip.MustParseAddrPort(target); got.from != want {
+		t.Fatalf("reassembled address = %v, want %v", got.from, want)
+	}
+	if got := released.Load(); got != 2 {
+		t.Fatalf("fragment releases = %d, want 2", got)
+	}
+}
+
+func TestUDPConnPacketReceiverDrainsQueuedMessage(t *testing.T) {
+	targetAddr := netip.MustParseAddrPort("192.0.2.10:5353")
+	messageAddr := netip.MustParseAddrPort("198.51.100.8:443")
+	var released atomic.Int32
+	u := &udpConn{
+		ID:                1,
+		D:                 &frag.Defragger{},
+		ReceiveCh:         make(chan *protocol.UDPMessage, 2),
+		target:            targetAddr.String(),
+		defaultTargetAddr: targetAddr,
+	}
+	u.ReceiveCh <- &protocol.UDPMessage{
+		SessionID: 1,
+		FragCount: 1,
+		Addr:      messageAddr.String(),
 		Data:      []byte("queued"),
+		Release:   func() { released.Add(1) },
 	}
 
 	packets := make(chan *netproxy.ReceivedPacket, 1)
@@ -122,12 +319,46 @@ func TestUDPConnPacketReceiverDrainsQueuedMessage(t *testing.T) {
 		if string(packet.Data) != "queued" {
 			t.Fatalf("packet data = %q, want queued", packet.Data)
 		}
-		if packet.From.String() != "192.0.2.10:5353" {
-			t.Fatalf("packet address = %v", packet.From)
+		if packet.From != messageAddr {
+			t.Fatalf("packet address = %v, want message address %v", packet.From, messageAddr)
 		}
 		packet.Release()
+		if got := released.Load(); got != 1 {
+			t.Fatalf("Release calls = %d, want 1", got)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("packet receiver did not drain queued message")
+	}
+}
+
+func TestUDPConnPacketReceiverMalformedAddressReleasesMessage(t *testing.T) {
+	var delivered atomic.Int32
+	var released atomic.Int32
+	u := &udpConn{
+		ID: 1,
+		D:  &frag.Defragger{},
+		receiver: func(packet *netproxy.ReceivedPacket) bool {
+			delivered.Add(1)
+			packet.Release()
+			return true
+		},
+	}
+
+	claimed := u.deliverMessage(&protocol.UDPMessage{
+		SessionID: 1,
+		FragCount: 1,
+		Addr:      "not-an-addr-port",
+		Data:      []byte("malformed"),
+		Release:   func() { released.Add(1) },
+	})
+	if !claimed {
+		t.Fatal("deliverMessage() = false, want malformed message claimed")
+	}
+	if got := delivered.Load(); got != 0 {
+		t.Fatalf("handler calls = %d, want 0 for malformed address", got)
+	}
+	if got := released.Load(); got != 1 {
+		t.Fatalf("Release calls = %d, want 1", got)
 	}
 }
 
@@ -156,18 +387,26 @@ func TestUDPSessionManagerUsesPacketReceiverForNewMessages(t *testing.T) {
 		_ = u.Close()
 	}()
 
+	var released atomic.Int32
 	m.feed(&protocol.UDPMessage{
 		SessionID: u.ID,
 		FragCount: 1,
 		Addr:      "198.51.100.8:443",
 		Data:      []byte("transport-owned"),
+		Release:   func() { released.Add(1) },
 	})
 	select {
 	case packet := <-packets:
 		if string(packet.Data) != "transport-owned" {
 			t.Fatalf("packet data = %q, want transport-owned", packet.Data)
 		}
+		if want := netip.MustParseAddrPort("198.51.100.8:443"); packet.From != want {
+			t.Fatalf("packet address = %v, want message address %v", packet.From, want)
+		}
 		packet.Release()
+		if got := released.Load(); got != 1 {
+			t.Fatalf("Release calls = %d, want 1", got)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("session manager did not use registered packet receiver")
 	}

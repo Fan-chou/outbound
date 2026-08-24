@@ -38,24 +38,34 @@ func BenchmarkNewUDP(b *testing.B) {
 	}
 }
 
-// BenchmarkDeliverMessage measures the hot path: datagram -> session -> handler.
-// Covers targetAddr caching (no ParseAddrPort) and Release callback wiring.
+// BenchmarkDeliverMessage measures delivery through the cached default-target
+// address path.
 func BenchmarkDeliverMessage(b *testing.B) {
+	benchmarkDeliverMessage(b, "203.0.113.10:443")
+}
+
+// BenchmarkDeliverMessageAlternateTarget measures delivery through the
+// per-datagram address parsing path used by multi-target FullCone sessions.
+func BenchmarkDeliverMessageAlternateTarget(b *testing.B) {
+	benchmarkDeliverMessage(b, "198.51.100.20:8443")
+}
+
+func benchmarkDeliverMessage(b *testing.B, messageAddr string) {
 	target := "203.0.113.10:443"
 	u := &udpConn{
-		ID:         1,
-		D:          &frag.Defragger{},
-		ReceiveCh:  make(chan *protocol.UDPMessage, udpMessageChanSize),
-		SendBuf:    sendBufPool.Get().([]byte),
-		target:     target,
-		targetAddr: mustAddrPort(target),
+		ID:                1,
+		D:                 &frag.Defragger{},
+		ReceiveCh:         make(chan *protocol.UDPMessage, udpMessageChanSize),
+		SendBuf:           sendBufPool.Get().([]byte),
+		target:            target,
+		defaultTargetAddr: mustAddrPort(target),
 	}
 	defer sendBufPool.Put(u.SendBuf)
 
 	msg := &protocol.UDPMessage{
 		SessionID: 1,
 		FragCount: 1,
-		Addr:      target,
+		Addr:      messageAddr,
 		Data:      make([]byte, 1200),
 	}
 

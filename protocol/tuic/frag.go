@@ -49,6 +49,7 @@ type deFragger struct {
 	frags          []*Packet
 	count          uint8
 	firstAddrPort  netip.AddrPort
+	firstAddrKey   string
 	hasFirstFrag   bool
 	lastUpdateNano atomic.Int64
 }
@@ -74,11 +75,21 @@ func (d *deFragger) IsExpired(nowNano int64, ttl time.Duration) bool {
 	return lastUpdateNano > 0 && nowNano-lastUpdateNano >= ttl.Nanoseconds()
 }
 
+func packetFragmentAddrKey(packet *Packet) string {
+	if packet == nil || packet.ADDR == nil || packet.ADDR.TYPE == AtypNone {
+		return ""
+	}
+	return packet.ADDR.String()
+}
+
 func packetFragmentAddrPort(packet *Packet) netip.AddrPort {
 	if packet == nil || packet.ADDR == nil || packet.ADDR.TYPE == AtypNone {
 		return netip.AddrPort{}
 	}
-	return packet.ADDR.UDPAddr().AddrPort()
+	if ap, ok := packet.ADDR.AddrPort(); ok {
+		return ap
+	}
+	return netip.AddrPort{}
 }
 
 func (d *deFragger) matches(packet *Packet) bool {
@@ -98,8 +109,8 @@ func (d *deFragger) matches(packet *Packet) bool {
 		if !d.hasFirstFrag {
 			return true
 		}
-		addrPort := packetFragmentAddrPort(packet)
-		return addrPort.IsValid() && d.firstAddrPort == addrPort
+		key := packetFragmentAddrKey(packet)
+		return key != "" && key == d.firstAddrKey
 	}
 	return d.frags[packet.FRAG_ID] == nil
 }
@@ -107,7 +118,7 @@ func (d *deFragger) matches(packet *Packet) bool {
 func (d *deFragger) Feed(m *Packet, p []byte, nowNano int64) (n int, addrPort netip.AddrPort, assembled bool) {
 	d.touch(nowNano)
 	if m.FRAG_TOTAL <= 1 {
-		return copy(p, m.DATA), m.ADDR.UDPAddr().AddrPort(), true
+		return copy(p, m.DATA), packetFragmentAddrPort(m), true
 	}
 	if m.FRAG_ID >= m.FRAG_TOTAL {
 		// wtf is this?
@@ -119,14 +130,16 @@ func (d *deFragger) Feed(m *Packet, p []byte, nowNano int64) (n int, addrPort ne
 		d.frags = make([]*Packet, m.FRAG_TOTAL)
 		d.count = 0
 		d.firstAddrPort = netip.AddrPort{}
+		d.firstAddrKey = ""
 		d.hasFirstFrag = false
 	}
 	if len(d.frags) != int(m.FRAG_TOTAL) {
 		return
 	}
 	if m.FRAG_ID == 0 {
-		if addr := packetFragmentAddrPort(m); addr.IsValid() {
-			d.firstAddrPort = addr
+		if key := packetFragmentAddrKey(m); key != "" {
+			d.firstAddrKey = key
+			d.firstAddrPort = packetFragmentAddrPort(m)
 			d.hasFirstFrag = true
 		}
 	}

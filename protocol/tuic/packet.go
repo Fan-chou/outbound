@@ -152,8 +152,10 @@ func (p *Packets) Close() error {
 type quicStreamPacketConn struct {
 	mu sync.Mutex
 
-	target string
-	addr   outboundcommon.LastStringValue[protocol.Metadata]
+	target            string
+	natIdentity       netip.AddrPort
+	defaultTargetAddr netip.AddrPort
+	addr              outboundcommon.LastStringValue[protocol.Metadata]
 
 	connId          uint16
 	quicConn        quic.Connection
@@ -396,6 +398,29 @@ func (q *quicStreamPacketConn) SetWriteDeadline(t time.Time) error {
 	return q.SetDeadline(t)
 }
 
+func (q *quicStreamPacketConn) addrPortFrom(addr *Address) netip.AddrPort {
+	if q.natIdentity.IsValid() {
+		return q.natIdentity
+	}
+	if addr == nil {
+		return netip.AddrPort{}
+	}
+	if ap, ok := addr.AddrPort(); ok {
+		return ap
+	}
+	if q.defaultTargetAddr.IsValid() && addr.String() == q.target {
+		return q.defaultTargetAddr
+	}
+	return netip.AddrPort{}
+}
+
+func (q *quicStreamPacketConn) addrPortFromAssembled(from netip.AddrPort) netip.AddrPort {
+	if q.natIdentity.IsValid() {
+		return q.natIdentity
+	}
+	return from
+}
+
 func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 	q.mu.Lock()
 	incomingPackets := q.incomingPackets
@@ -413,7 +438,7 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 		}
 		if packet.FRAG_TOTAL <= 1 {
 			n := copy(p, packet.DATA)
-			addr := packet.ADDR.UDPAddr().AddrPort()
+			addr := q.addrPortFrom(packet.ADDR)
 			packet.releaseData()
 			return n, addr, nil
 		}
@@ -426,7 +451,7 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 			if bucket.len() == 0 {
 				q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
 			}
-			return
+			return n, q.addrPortFromAssembled(addr), nil
 		}
 	}
 }
@@ -463,7 +488,7 @@ func (q *quicStreamPacketConn) deliverPacket(handler netproxy.PacketReceiveHandl
 		}
 		received := netproxy.NewReceivedPacket(
 			packet.DATA,
-			packet.ADDR.UDPAddr().AddrPort(),
+			q.addrPortFrom(packet.ADDR),
 			nil,
 			packet.releaseData,
 		)
@@ -485,7 +510,7 @@ func (q *quicStreamPacketConn) deliverPacket(handler netproxy.PacketReceiveHandl
 		return true
 	}
 	q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
-	received := netproxy.NewReceivedPacket(buffer[:n], addr, nil, buffer.Put)
+	received := netproxy.NewReceivedPacket(buffer[:n], q.addrPortFromAssembled(addr), nil, buffer.Put)
 	if handler(received) {
 		return true
 	}

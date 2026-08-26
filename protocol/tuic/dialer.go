@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -137,7 +138,14 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			if err != nil {
 				return nil, err
 			}
-			udpConn.(*quicStreamPacketConn).target = addr
+			pc := udpConn.(*quicStreamPacketConn)
+			pc.target = addr
+			if ap, err := netip.ParseAddrPort(addr); err == nil {
+				pc.defaultTargetAddr = ap
+			}
+			if hint, ok := netproxy.UDPReplyAddrFromContext(ctx, addr); ok {
+				pc.natIdentity = hint
+			}
 			return udpConn, nil
 		}
 

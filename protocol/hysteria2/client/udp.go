@@ -3,6 +3,7 @@ package client
 import (
 	"errors"
 	"io"
+	"net"
 	"net/netip"
 	"runtime"
 	"sync"
@@ -66,6 +67,7 @@ type udpConn struct {
 	timer             *time.Timer
 	target            string
 	defaultTargetAddr netip.AddrPort // validated at session creation; replies may differ
+	natIdentity       netip.AddrPort // dae original dest; authoritative when set
 	receiverMu        sync.Mutex
 	receiver          netproxy.PacketReceiveHandler
 }
@@ -119,10 +121,15 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 
 // addrForMessage returns the datagram's peer. WriteTo may send to other
 // targets (dae FullCone), and each reply carries the actual peer in
-// UDPMessage.Addr. The session default is cached to keep the common path
-// allocation-free; only a different spelling or peer pays ParseAddrPort.
+// UDPMessage.Addr. An IP default is cached to keep the common path
+// allocation-free. A domain default (hy2 allows host:port on the wire)
+// uses the userspace-NAT identity passed at session creation so a server
+// echo of the original host:port can be returned without local DNS.
 func (u *udpConn) addrForMessage(addr string) (netip.AddrPort, error) {
-	if addr == u.target {
+	if u.natIdentity.IsValid() {
+		return u.natIdentity, nil
+	}
+	if addr == u.target && u.defaultTargetAddr.IsValid() {
 		return u.defaultTargetAddr, nil
 	}
 	return netip.ParseAddrPort(addr)
@@ -503,6 +510,10 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 
 // NewUDP creates a new UDP session.
 func (m *udpSessionManager) NewUDP(addr string) (netproxy.Conn, error) {
+	return m.openUDP(addr, netip.AddrPort{})
+}
+
+func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netproxy.Conn, error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -513,11 +524,19 @@ func (m *udpSessionManager) NewUDP(addr string) (netproxy.Conn, error) {
 	id := m.nextID
 	m.nextID++
 
-	// Validate the default target at session creation. WriteTo may send to
-	// other targets, and each reply carries its actual peer in UDPMessage.Addr.
-	defaultTargetAddr, err := netip.ParseAddrPort(addr)
-	if err != nil {
+	// Hy2 UDP addresses are opaque host:port strings. A domain is valid on
+	// the wire (the server resolves it). Cache an AddrPort when the default
+	// target is already an IP so the no-hint path stays allocation-free.
+	// When dae supplies a NAT identity, every reply of this session uses it:
+	// the server-reported IP may be a resolve_dns result, while the client
+	// socket still expects the original destination (including FakeIP).
+	if _, _, err := net.SplitHostPort(addr); err != nil {
 		return nil, err
+	}
+	defaultTargetAddr, _ := netip.ParseAddrPort(addr)
+	var natIdentity netip.AddrPort
+	if replyAddr.IsValid() && replyAddr.Port() != 0 {
+		natIdentity = replyAddr
 	}
 
 	conn := &udpConn{
@@ -532,6 +551,7 @@ func (m *udpSessionManager) NewUDP(addr string) (netproxy.Conn, error) {
 		muTimer:           sync.Mutex{},
 		target:            addr,
 		defaultTargetAddr: defaultTargetAddr,
+		natIdentity:       natIdentity,
 	}
 	conn.CloseFunc = func() {
 		m.close(conn)

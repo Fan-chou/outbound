@@ -163,6 +163,82 @@ func TestUDPConnReadFromMalformedAddressReleasesMessage(t *testing.T) {
 	}
 }
 
+func TestNewUDPAllowsDomainTarget(t *testing.T) {
+	m := &udpSessionManager{
+		io:     noopUDPTestIO{},
+		m:      make(map[uint32]*udpConn),
+		nextID: 1,
+		done:   make(chan struct{}),
+	}
+	connRaw, err := m.NewUDP("chatgpt.com:443")
+	if err != nil {
+		t.Fatalf("NewUDP(domain) error = %v", err)
+	}
+	u := connRaw.(*udpConn)
+	defer m.close(u)
+	if u.target != "chatgpt.com:443" {
+		t.Fatalf("target = %q", u.target)
+	}
+	if u.defaultTargetAddr.IsValid() {
+		t.Fatalf("domain session must not cache an AddrPort, got %v", u.defaultTargetAddr)
+	}
+	got, err := u.addrForMessage("198.51.100.8:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != netip.MustParseAddrPort("198.51.100.8:443") {
+		t.Fatalf("reply IP = %v", got)
+	}
+	if _, err := u.addrForMessage("chatgpt.com:443"); err == nil {
+		t.Fatal("domain echo without a reply identity must not look like an AddrPort")
+	}
+
+	hint := netip.MustParseAddrPort("198.51.100.10:443")
+	connWithHint, err := m.openUDP("chatgpt.com:443", hint)
+	if err != nil {
+		t.Fatalf("openUDP(domain, hint) error = %v", err)
+	}
+	uHint := connWithHint.(*udpConn)
+	defer m.close(uHint)
+	if uHint.natIdentity != hint {
+		t.Fatalf("domain session reply identity = %v, want %v", uHint.natIdentity, hint)
+	}
+	got, err = uHint.addrForMessage("chatgpt.com:443")
+	if err != nil {
+		t.Fatalf("domain echo with reply identity: %v", err)
+	}
+	if got != hint {
+		t.Fatalf("domain echo = %v, want original dest %v", got, hint)
+	}
+}
+
+func TestOpenUDPIPTargetUsesReplyHint(t *testing.T) {
+	m := &udpSessionManager{
+		io:     noopUDPTestIO{},
+		m:      make(map[uint32]*udpConn),
+		nextID: 1,
+		done:   make(chan struct{}),
+	}
+	wire := netip.MustParseAddrPort("203.0.113.1:443")
+	hint := netip.MustParseAddrPort("198.18.0.1:443")
+	connRaw, err := m.openUDP(wire.String(), hint)
+	if err != nil {
+		t.Fatalf("openUDP() error = %v", err)
+	}
+	u := connRaw.(*udpConn)
+	defer m.close(u)
+	if u.defaultTargetAddr != wire {
+		t.Fatalf("wire IP cache = %v, want %v", u.defaultTargetAddr, wire)
+	}
+	got, err := u.addrForMessage(wire.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != hint {
+		t.Fatalf("resolve_dns reply identity = %v, want original dest %v", got, hint)
+	}
+}
+
 func TestUDPConnMessageAddrUsesDefaultCacheAndPerDatagramFallback(t *testing.T) {
 	m := &udpSessionManager{
 		io:     noopUDPTestIO{},
@@ -356,6 +432,53 @@ func TestUDPConnPacketReceiverMalformedAddressReleasesMessage(t *testing.T) {
 	}
 	if got := delivered.Load(); got != 0 {
 		t.Fatalf("handler calls = %d, want 0 for malformed address", got)
+	}
+	if got := released.Load(); got != 1 {
+		t.Fatalf("Release calls = %d, want 1", got)
+	}
+}
+
+func TestUDPConnDeliverDomainEchoUsesReplyIdentity(t *testing.T) {
+	m := &udpSessionManager{
+		io:     noopUDPTestIO{},
+		m:      make(map[uint32]*udpConn),
+		nextID: 1,
+		done:   make(chan struct{}),
+	}
+	hint := netip.MustParseAddrPort("198.51.100.10:443")
+	connRaw, err := m.openUDP("chatgpt.com:443", hint)
+	if err != nil {
+		t.Fatalf("openUDP() error = %v", err)
+	}
+	u := connRaw.(*udpConn)
+	defer m.close(u)
+
+	gotCh := make(chan netip.AddrPort, 1)
+	if _, ok := u.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+		gotCh <- packet.From
+		packet.Release()
+		return true
+	}); !ok {
+		t.Fatal("RegisterPacketReceiver() = false")
+	}
+
+	var released atomic.Int32
+	if !u.deliverMessage(&protocol.UDPMessage{
+		SessionID: u.ID,
+		FragCount: 1,
+		Addr:      "chatgpt.com:443",
+		Data:      []byte("pong"),
+		Release:   func() { released.Add(1) },
+	}) {
+		t.Fatal("deliverMessage(domain echo) = false")
+	}
+	select {
+	case from := <-gotCh:
+		if from != hint {
+			t.Fatalf("domain echo from = %v, want %v", from, hint)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler did not receive domain echo")
 	}
 	if got := released.Load(); got != 1 {
 		t.Fatalf("Release calls = %d, want 1", got)

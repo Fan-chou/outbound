@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"testing"
@@ -336,6 +337,33 @@ func TestPacketReadFromDrainsShortBuffer(t *testing.T) {
 	}
 	if n != 2 || string(buf) != "ef" {
 		t.Fatalf("second packet = %q/%d, want ef/2", string(buf), n)
+	}
+}
+
+func TestPacketReadFromUsesReplyIdentityForDomainTarget(t *testing.T) {
+	s := newSession(&recordingConn{}, 1)
+	hint := netip.MustParseAddrPort("198.18.0.10:443")
+	packet := &packetStream{
+		stream:    newStream(s, 1),
+		addr:      "chatgpt.com:443",
+		replyFrom: hint,
+	}
+	payload := appendLengthPrefixed(nil, []byte("pong"))
+	chunk := pool.Get(len(payload))
+	copy(chunk, payload)
+	if err := packet.enqueue(chunk); err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	buf := make([]byte, 16)
+	n, from, err := packet.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+	if n != 4 || string(buf[:n]) != "pong" {
+		t.Fatalf("payload = %q/%d", string(buf[:n]), n)
+	}
+	if from != hint {
+		t.Fatalf("from = %v, want %v", from, hint)
 	}
 }
 

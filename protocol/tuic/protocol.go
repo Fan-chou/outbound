@@ -583,6 +583,19 @@ func (c Address) String() string {
 	}
 }
 
+func (c Address) AddrPort() (netip.AddrPort, bool) {
+	switch c.TYPE {
+	case AtypIPv4, AtypIPv6:
+		addr, ok := netip.AddrFromSlice(c.ADDR)
+		if !ok {
+			return netip.AddrPort{}, false
+		}
+		return netip.AddrPortFrom(addr.Unmap(), c.PORT), true
+	default:
+		return netip.AddrPort{}, false
+	}
+}
+
 func (c Address) UDPAddr() *net.UDPAddr {
 	return &net.UDPAddr{
 		IP:   c.ADDR,

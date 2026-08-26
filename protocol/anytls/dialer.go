@@ -141,6 +141,9 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 				_ = s.Close()
 				return nil, err
 			}
+			if hint, ok := netproxy.UDPReplyAddrFromContext(ctx, addr); ok {
+				packetStream.replyFrom = hint
+			}
 			return packetStream, nil
 		}
 		stream, err := s.newStream(addr)

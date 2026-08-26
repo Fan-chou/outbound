@@ -352,7 +352,8 @@ func (c *clientImpl) UDP(addr string, ctx context.Context) (netproxy.Conn, error
 	if udpSMSnapshot == nil {
 		return nil, coreErrs.DialError{Message: "UDP not enabled"}
 	}
-	conn, err := udpSMSnapshot.NewUDP(addr)
+	replyAddr, _ := netproxy.UDPReplyAddrFromContext(ctx, addr)
+	conn, err := udpSMSnapshot.openUDP(addr, replyAddr)
 	c.handleIfConnectionClosed(err, connSnapshot)
 	return conn, err
 }

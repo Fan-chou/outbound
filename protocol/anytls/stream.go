@@ -290,6 +290,7 @@ type packetStream struct {
 	*stream
 
 	addr         string
+	replyFrom    netip.AddrPort
 	udpWriteAddr atomic.Bool
 }
 
@@ -306,7 +307,12 @@ func (ps *packetStream) ReadFrom(p []byte) (int, netip.AddrPort, error) {
 	ps.readMutex.Lock()
 	defer ps.readMutex.Unlock()
 
-	addr, _ := netip.ParseAddrPort(ps.addr)
+	addr, err := netip.ParseAddrPort(ps.addr)
+	if err != nil {
+		addr = ps.replyFrom
+	} else if ps.replyFrom.IsValid() {
+		addr = ps.replyFrom
+	}
 	var length uint16
 	var lengthBuf [2]byte
 	if err := ps.readFullLocked(lengthBuf[:]); err != nil {

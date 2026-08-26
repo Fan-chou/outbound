@@ -148,6 +148,81 @@ func TestQuicStreamPacketConnPacketReceiverDeliversQueuedDatagram(t *testing.T) 
 	_ = q.Close()
 }
 
+func TestQuicStreamPacketConnDomainEchoUsesReplyIdentity(t *testing.T) {
+	host := "chatgpt.com"
+	addr := &Address{TYPE: AtypDomainName, ADDR: append([]byte{byte(len(host))}, host...), PORT: 443}
+	hint := netip.MustParseAddrPort("198.51.100.10:443")
+	packets := NewPackets()
+	packets.PushBack(&Packet{
+		FRAG_TOTAL: 1,
+		DATA:       []byte("pong"),
+		ADDR:       addr,
+	})
+	q := &quicStreamPacketConn{
+		incomingPackets: packets,
+		target:          "chatgpt.com:443",
+		natIdentity:     hint,
+	}
+	delivered := make(chan *netproxy.ReceivedPacket, 1)
+	unregister, ok := q.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+		delivered <- packet
+		return true
+	})
+	if !ok {
+		t.Fatal("expected packet receiver registration")
+	}
+	defer unregister()
+
+	select {
+	case packet := <-delivered:
+		if packet.From != hint {
+			t.Fatalf("domain echo from = %v, want %v", packet.From, hint)
+		}
+		packet.Release()
+	case <-time.After(time.Second):
+		t.Fatal("packet receiver did not deliver domain echo")
+	}
+	_ = q.Close()
+}
+
+func TestQuicStreamPacketConnDomainFragmentsAssembleWithReplyIdentity(t *testing.T) {
+	host := "chatgpt.com"
+	addr := &Address{TYPE: AtypDomainName, ADDR: append([]byte{byte(len(host))}, host...), PORT: 443}
+	hint := netip.MustParseAddrPort("198.51.100.10:443")
+	packets := NewPackets()
+	q := &quicStreamPacketConn{
+		incomingPackets: packets,
+		target:          "chatgpt.com:443",
+		natIdentity:     hint,
+	}
+	delivered := make(chan *netproxy.ReceivedPacket, 1)
+	unregister, ok := q.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+		delivered <- packet
+		return true
+	})
+	if !ok {
+		t.Fatal("expected packet receiver registration")
+	}
+	defer unregister()
+
+	packets.PushBack(&Packet{PKT_ID: 7, FRAG_TOTAL: 2, FRAG_ID: 0, ADDR: addr, DATA: []byte("hel")})
+	packets.PushBack(&Packet{PKT_ID: 7, FRAG_TOTAL: 2, FRAG_ID: 1, ADDR: &Address{TYPE: AtypNone}, DATA: []byte("lo")})
+
+	select {
+	case packet := <-delivered:
+		if string(packet.Data) != "hello" {
+			t.Fatalf("assembled data = %q, want hello", packet.Data)
+		}
+		if packet.From != hint {
+			t.Fatalf("assembled from = %v, want %v", packet.From, hint)
+		}
+		packet.Release()
+	case <-time.After(time.Second):
+		t.Fatal("domain fragments did not assemble")
+	}
+	_ = q.Close()
+}
+
 func TestQuicStreamPacketConnPacketReceiverAssemblesFragments(t *testing.T) {
 	packets := NewPackets()
 	q := &quicStreamPacketConn{incomingPackets: packets}

@@ -66,9 +66,13 @@ func (c *PacketConn) ReadFrom(b []byte) (n int, from netip.AddrPort, err error) 
 		return 0, netip.AddrPort{}, fmt.Errorf("no addr present")
 	}
 
-	from, err = netip.ParseAddrPort(addr.String())
-	if err != nil {
-		return 0, netip.AddrPort{}, fmt.Errorf("bad addr: %w", err)
+	from, ok := addr.AddrPort()
+	if !ok {
+		var err error
+		from, err = netip.ParseAddrPort(addr.String())
+		if err != nil {
+			return 0, netip.AddrPort{}, fmt.Errorf("bad addr: %w", err)
+		}
 	}
 
 	//if len(b) < len(decoded.Bytes())-len(addr) {
@@ -89,7 +93,7 @@ func (c *PacketConn) WriteTo(b []byte, to string) (n int, err error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	pb := pool.GetMustBigger(len(addr) + len(b))
+	pb := pool.Get(len(addr) + len(b))
 	defer pool.Put(pb)
 
 	copy(pb, addr)

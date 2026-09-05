@@ -15,7 +15,6 @@ import (
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
-	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/daeuniverse/outbound/protocol/http"
 	"github.com/daeuniverse/outbound/transport/grpc"
 	"github.com/daeuniverse/outbound/transport/httpheader"
@@ -252,7 +251,7 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 				"transport":         []string{"1"},
 			}.Encode(),
 		}
-		d, err = http.NewHTTPProxy(&u, direct.SymmetricDirect)
+		d, err = http.NewHTTPProxy(&u, nextDialer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -364,6 +363,10 @@ func ParseVlessURL(vless string) (data *V2Ray, err error) {
 	return data, nil
 }
 
+// vmessLegacyAddrRe parses the legacy vmess://BASE64 form's
+// "Security:UUID@Host:Port" body.
+var vmessLegacyAddrRe = regexp.MustCompile(`.*:(.+)@(.+):(\d+)`)
+
 func ParseVmessURL(vmess string) (data *V2Ray, err error) {
 	var info V2Ray
 	// perform base64 decoding and unmarshal to VmessInfo
@@ -378,7 +381,7 @@ func ParseVmessURL(vmess string) (data *V2Ray, err error) {
 		if err != nil {
 			return
 		}
-		re := regexp.MustCompile(`.*:(.+)@(.+):(\d+)`)
+		re := vmessLegacyAddrRe
 		s := strings.Split(vmess[8:], "?")[0]
 		s, err = common.Base64StdDecode(s)
 		if err != nil {

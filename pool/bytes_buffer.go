@@ -11,12 +11,11 @@ import (
 // this caps worst-case retention at roughly 256 x 32KB = 8MB.
 const maxBufferPoolLen = 256
 
-// bufferPool recycles serialization buffers for tuic/juicity per-packet
-// encode/decode. It is a GC-stable LIFO pool: sync.Pool is cleared on every
-// GC cycle, and under GC pressure the pool stays empty so every packet
-// re-grows its backing slice, feeding the GC loop. LIFO keeps the temporal
-// locality that a FIFO channel pool lacks — a buffer grown to one packet size
-// is immediately reused by the next packet of the same size.
+// bufferPool recycles bounded serialization buffers for connection-level
+// TUIC and Juicity frames. The explicit LIFO provides deterministic retention;
+// sync.Pool instead uses a one-GC victim cache and may discard entries later.
+// Per-datagram sends use connection-private scratch buffers, so this mutex is
+// not on the packet hot path and carries no throughput claim.
 var bufferPool = newBufferPool()
 
 type bufferPoolT struct {

@@ -2,6 +2,7 @@ package client
 
 import (
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -9,16 +10,8 @@ import (
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
 )
 
-func mustAddrPort(s string) netip.AddrPort {
-	ap, err := netip.ParseAddrPort(s)
-	if err != nil {
-		panic(err)
-	}
-	return ap
-}
-
-// BenchmarkNewUDP measures session creation cost (SendBuf pool + AddrPort
-// parse-once). Compared against the pre-change make([]byte) per session.
+// BenchmarkNewUDP measures session creation cost, including default target
+// validation and reuse of the pooled send buffer.
 func BenchmarkNewUDP(b *testing.B) {
 	m := &udpSessionManager{
 		io:     noopUDPTestIO{},
@@ -52,25 +45,27 @@ func BenchmarkDeliverMessageAlternateTarget(b *testing.B) {
 
 func benchmarkDeliverMessage(b *testing.B, messageAddr string) {
 	target := "203.0.113.10:443"
+	messageAddr = strings.Clone(messageAddr)
 	u := &udpConn{
 		ID:                1,
 		D:                 &frag.Defragger{},
 		ReceiveCh:         make(chan *protocol.UDPMessage, udpMessageChanSize),
 		SendBuf:           sendBufPool.Get().([]byte),
 		target:            target,
-		defaultTargetAddr: mustAddrPort(target),
+		defaultTargetAddr: netip.MustParseAddrPort(target),
 	}
 	defer sendBufPool.Put(u.SendBuf)
 
 	msg := &protocol.UDPMessage{
 		SessionID: 1,
 		FragCount: 1,
-		Addr:      messageAddr,
+		Addr:      []byte(messageAddr),
 		Data:      make([]byte, 1200),
 	}
 
-	var handlerFn netproxy.PacketReceiveHandler = func(*netproxy.ReceivedPacket) bool {
-		return true // accept and immediately release
+	var handlerFn netproxy.PacketReceiveHandler = func(packet *netproxy.ReceivedPacket) bool {
+		packet.Release()
+		return true
 	}
 	u.RegisterPacketReceiver(handlerFn)
 

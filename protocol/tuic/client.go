@@ -1,12 +1,13 @@
 package tuic
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	outbounderrors "github.com/daeuniverse/outbound/common/errors"
@@ -20,18 +21,11 @@ import (
 
 const Ver5 = 0x5
 
-// tuicImmediateFailureWindow bounds how long DialContext waits for the peer
-// to signal an immediate connect failure (e.g. RESET_STREAM from the server
-// when the target is unreachable) before declaring the stream established.
-//
-// The window only needs to cover the round trip in which the server processes
-// the CONNECT header and reports the outcome: a handful of milliseconds on
-// LAN/metro links. A larger fixed value buys nothing for high-latency WAN
-// paths (the failure signal arrives well beyond any reasonable window) and
-// simply taxes every successful connection with that latency. 15ms keeps
-// fast-fail detection for realistic low-RTT deployments while trimming the
-// per-connection cost of the old 75ms constant ~5x.
-const tuicImmediateFailureWindow = 15 * time.Millisecond
+// uniStreamReadIdleTimeout bounds how long a server-opened uni stream may
+// stall before the relay goroutine gives up. Each uni stream carries exactly
+// one packet command, so this only fires on a wedged or hostile peer; without
+// it such streams would pin uni-stream semaphore slots forever.
+const uniStreamReadIdleTimeout = 30 * time.Second
 
 type ClientOption struct {
 	TlsConfig             *tls.Config
@@ -55,7 +49,9 @@ type clientImpl struct {
 	quicConn  quic.Connection
 	connMutex sync.Mutex
 
-	closed bool
+	// closed is read without connMutex on the per-dial fast path and set
+	// under it in forceClose; atomicity keeps those entry checks race-free.
+	closed atomic.Bool
 
 	udpIncomingPacketsMap sync.Map
 
@@ -86,6 +82,10 @@ func (t *clientImpl) releaseUniStreamSlot() {
 func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (quic.Connection, error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
+	return t.getQuicConnLocked(ctx, dialer, dialFn)
+}
+
+func (t *clientImpl) getQuicConnLocked(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (quic.Connection, error) {
 	if t.quicConn != nil {
 		return t.quicConn, nil
 	}
@@ -107,9 +107,12 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 
 	common.SetCongestionController(quicConn, t.CongestionController, t.CWND)
 
-	go func() {
-		_ = t.sendAuthentication(quicConn)
-	}()
+	if err = t.sendAuthentication(quicConn); err != nil {
+		_ = quicConn.CloseWithError(ProtocolError, err.Error())
+		_ = transport.Close()
+		_ = transport.Conn.Close()
+		return nil, err
+	}
 
 	if t.udp && t.UdpRelayMode == common.QUIC {
 		go func() {
@@ -126,9 +129,9 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 }
 
 func (t *clientImpl) sendAuthentication(quicConn quic.Connection) (err error) {
-	defer func() {
-		t.deferQuicConn(quicConn, err)
-	}()
+	// The caller holds connMutex until authentication succeeds and owns cleanup
+	// on failure. Calling deferQuicConn here would re-enter forceClose and
+	// deadlock on that mutex.
 	stream, err := quicConn.OpenUniStream()
 	if err != nil {
 		return err
@@ -181,27 +184,34 @@ func (t *clientImpl) handleUniStream(quicConn quic.Connection) (err error) {
 				}
 				stream.CancelRead(0)
 			}()
-			reader := bufio.NewReader(stream)
-			var commandHead *CommandHead
-			commandHead, err = ReadCommandHead(reader)
+			// Each uni stream carries exactly one packet command; parse it
+			// incrementally instead of wrapping the stream in a fresh
+			// bufio.Reader and routing every field through binary.Read.
+			// A non-Packet command is a spec violation: readPacketFromStream
+			// errors and deferQuicConn forceCloses the tunnel.
+			_ = stream.SetReadDeadline(time.Now().Add(uniStreamReadIdleTimeout))
+			var packet *Packet
+			packet, err = readPacketFromStream(stream)
 			if err != nil {
+				var nErr net.Error
+				if errors.As(err, &nErr) && nErr.Timeout() {
+					// The stream stalled past the idle timeout. Reclaim the
+					// slot without tearing down the tunnel: treat it like a
+					// benign dropped stream (CancelRead runs in the defer),
+					// not like a protocol violation.
+					err = nil
+				}
 				return
 			}
-			switch commandHead.TYPE {
-			case PacketType:
-				var packet *Packet
-				packet, err = ReadPacketWithHead(commandHead, reader)
-				if err != nil {
+			if t.udp && t.UdpRelayMode == common.QUIC {
+				assocId = packet.ASSOC_ID
+				if val, ok := t.udpIncomingPacketsMap.Load(assocId); ok {
+					packets := val.(*Packets)
+					packets.PushBack(packet)
 					return
 				}
-				if t.udp && t.UdpRelayMode == common.QUIC {
-					assocId = packet.ASSOC_ID
-					if val, ok := t.udpIncomingPacketsMap.Load(assocId); ok {
-						packets := val.(*Packets)
-						packets.PushBack(packet)
-					}
-				}
 			}
+			packet.releaseData()
 		}(stream)
 	}
 }
@@ -216,6 +226,13 @@ func (t *clientImpl) handleMessage(quicConn quic.Connection) (err error) {
 		message, err := quicConn.ReceiveDatagram(context.Background())
 		if err != nil {
 			if outbounderrors.IsTemporaryError(err) {
+				// Some temporary errors (notably stateless reset) are
+				// delivered after the datagram queue is already closed, so
+				// Receive returns immediately from then on. Exit via the
+				// connection context instead of spinning in a tight loop.
+				if ctxErr := quicConn.Context().Err(); ctxErr != nil {
+					return ctxErr
+				}
 				continue
 			}
 			return err
@@ -265,26 +282,49 @@ func (t *clientImpl) processDatagram(quicConn quic.Connection, message []byte) {
 }
 
 func (t *clientImpl) deferQuicConn(quicConn quic.Connection, err error) {
-	// Only close connection on non-temporary errors
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) {
+		return
+	}
+	// A closed QUIC connection can surface as a temporary net.Error
+	// (stateless reset) or context.Canceled. Those must still retire the
+	// shared tunnel; otherwise getQuicConn keeps handing out the dead conn.
+	if quicConn != nil && quicConn.Context().Err() != nil {
+		t.forceClose(quicConn, err)
+		return
+	}
+	// Only close connection on non-temporary errors. Stream exhaustion is a
+	// per-attempt condition: quic-go reports it as *quic.StreamLimitReachedError
+	// ("too many open streams"), which IsStreamExhausted matches, so the shared
+	// tunnel survives and callers fall back instead of tearing it down.
 	if err != nil &&
 		!outbounderrors.IsTemporaryError(err) &&
-		err != outbounderrors.ErrStreamExhausted {
+		!outbounderrors.IsStreamExhausted(err) {
 		t.forceClose(quicConn, err)
 	}
 }
 
 func (t *clientImpl) forceClose(quicConn quic.Connection, err error) {
 	t.connMutex.Lock()
-	if t.closed {
+	if t.closed.Load() {
 		t.connMutex.Unlock()
 		return
 	}
-	t.closed = true
+	t.closed.Store(true)
 	if t.onClose != nil {
 		go t.onClose()
 		t.onClose = nil
 	}
 	t.connMutex.Unlock()
+	// Tear the association queues down immediately: polling ReadFrom
+	// callers must not stay blocked in PopFrontBlock for the whole 10s
+	// grace period after the transport is already dead. The QUIC and
+	// underlay closes below still get their grace period.
+	t.udpIncomingPacketsMap.Range(func(key, value any) bool {
+		_ = value.(*Packets).Close()
+		t.udpIncomingPacketsMap.Delete(key)
+		return true
+	})
 	// Give 10s for closing.
 	time.AfterFunc(10*time.Second, func() {
 		t.connMutex.Lock()
@@ -305,36 +345,15 @@ func (t *clientImpl) forceClose(quicConn quic.Connection, err error) {
 			_ = quicConn.CloseWithError(ProtocolError, errStr)
 		}
 		if t.underConn != nil {
-			err = t.underConn.Close()
+			_ = t.underConn.Close()
 			t.underConn = nil
 		}
-		t.udpIncomingPacketsMap.Range(func(key, value any) bool {
-			_ = value.(*Packets).Close()
-			t.udpIncomingPacketsMap.Delete(key)
-			return true
-		})
 	})
 }
 
 func (t *clientImpl) Close() error {
 	t.forceClose(nil, common.ErrClientClosed)
 	return nil
-}
-
-func tuicConnectConfirmationWindow(ctx context.Context) time.Duration {
-	if ctx == nil {
-		return tuicImmediateFailureWindow
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return 0
-		}
-		if remaining < tuicImmediateFailureWindow {
-			return remaining
-		}
-	}
-	return tuicImmediateFailureWindow
 }
 
 func tuicContextCause(ctx context.Context) error {
@@ -350,24 +369,7 @@ func tuicContextCause(ctx context.Context) error {
 	return context.Canceled
 }
 
-func waitForImmediateTUICConnectFailure(ctx context.Context, quicConn quic.Connection, stream quic.Stream) error {
-	window := tuicConnectConfirmationWindow(ctx)
-	if window <= 0 {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-quicConn.Context().Done():
-			return tuicContextCause(quicConn.Context())
-		case <-stream.Context().Done():
-			return tuicContextCause(stream.Context())
-		default:
-			return nil
-		}
-	}
-
-	timer := time.NewTimer(window)
-	defer timer.Stop()
-
+func checkImmediateTUICConnectFailure(ctx context.Context, quicConn quic.Connection, stream quic.Stream) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -375,13 +377,13 @@ func waitForImmediateTUICConnectFailure(ctx context.Context, quicConn quic.Conne
 		return tuicContextCause(quicConn.Context())
 	case <-stream.Context().Done():
 		return tuicContextCause(stream.Context())
-	case <-timer.C:
+	default:
 		return nil
 	}
 }
 
 func (t *clientImpl) DialContextWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (netproxy.Conn, error) {
-	if t.closed {
+	if t.closed.Load() {
 		return nil, common.ErrClientClosed
 	}
 	quicConn, err := t.getQuicConn(ctx, dialer, dialFn)
@@ -407,7 +409,7 @@ func (t *clientImpl) DialContextWithDialer(ctx context.Context, metadata *protoc
 			_ = quicStream.Close()
 			return nil, err
 		}
-		if err = waitForImmediateTUICConnectFailure(ctx, quicConn, quicStream); err != nil {
+		if err = checkImmediateTUICConnectFailure(ctx, quicConn, quicStream); err != nil {
 			_ = quicStream.Close()
 			return nil, err
 		}
@@ -427,10 +429,15 @@ func (t *clientImpl) DialContextWithDialer(ctx context.Context, metadata *protoc
 }
 
 func (t *clientImpl) ListenPacketWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (*quicStreamPacketConn, error) {
-	if t.closed {
+	if t.closed.Load() {
 		return nil, common.ErrClientClosed
 	}
-	quicConn, err := t.getQuicConn(ctx, dialer, dialFn)
+	t.connMutex.Lock()
+	defer t.connMutex.Unlock()
+	if t.closed.Load() {
+		return nil, common.ErrClientClosed
+	}
+	quicConn, err := t.getQuicConnLocked(ctx, dialer, dialFn)
 	if err != nil {
 		return nil, err
 	}

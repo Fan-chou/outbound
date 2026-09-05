@@ -56,6 +56,10 @@ type RealityUConn struct {
 	Verified   bool
 }
 
+// AlreadyReadBuffered marks RealityUConn as having a TLS record buffer so
+// protocol dialers do not wrap it again with BufferedReaderConn.
+func (c *RealityUConn) AlreadyReadBuffered() {}
+
 var (
 	realityPeerCertificatesFieldOnce sync.Once
 	realityPeerCertificatesField     reflect.StructField
@@ -265,6 +269,7 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 		{
 			err = uConn.BuildHandshakeState()
 			if err != nil {
+				_ = c.Close()
 				return nil, err
 			}
 			hello := uConn.HandshakeState.Hello
@@ -283,17 +288,21 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 			if ecdheKey == nil {
 				// logrus.Println("wtf", retry, addr)
 				if retry > 2 {
+					_ = c.Close()
 					return nil, errors.New("nil ecdheKey")
 				}
+				_ = c.Close() // this attempt's underlay is orphaned by the retry
 				retry++
 				goto retryHandshake // retry
 			}
 			// logrus.Println("OH YEAH", retry)
 			uConn.AuthKey, _ = ecdheKey.ECDH(x.publicKey)
 			if uConn.AuthKey == nil {
+				_ = c.Close()
 				return nil, errors.New("REALITY: SharedKey == nil")
 			}
 			if _, err := hkdf.New(sha256.New, uConn.AuthKey, hello.Random[:20], []byte("REALITY")).Read(uConn.AuthKey); err != nil {
+				_ = c.Close()
 				return nil, err
 			}
 			var aead cipher.AEAD
@@ -311,6 +320,7 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 		}
 		// logrus.Println("00")
 		if err := uConn.HandshakeContext(ctx); err != nil {
+			_ = c.Close()
 			return nil, err
 		}
 		// if config.Show {
@@ -439,9 +449,14 @@ func getPathLocked(paths map[string]bool) string {
 }
 
 func randBetween(left int64, right int64) int64 {
-	if left == right {
+	if left >= right {
 		return left
 	}
-	bigInt, _ := rand.Int(rand.Reader, big.NewInt(right-left))
+	bigInt, err := rand.Int(rand.Reader, big.NewInt(right-left))
+	if err != nil || bigInt == nil {
+		// Entropy failure must not panic on a nil big.Int; fall back to the
+		// lower bound.
+		return left
+	}
 	return left + bigInt.Int64()
 }

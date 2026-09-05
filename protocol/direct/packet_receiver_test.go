@@ -3,12 +3,14 @@
 package direct
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"golang.org/x/sys/unix"
 )
 
 func TestDirectPacketReceiverMultiplexesSockets(t *testing.T) {
@@ -101,6 +103,31 @@ func TestDirectPacketReceiverRejectsSecondRegistrationAndCloseUnregisters(t *tes
 	}
 }
 
+func newUnixDatagramReceiverEntry(t *testing.T) (*directPacketReceiverEntry, int, func()) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	entry := &directPacketReceiverEntry{fd: fds[0]}
+	entry.active.Store(true)
+	return entry, fds[1], func() {
+		entry.active.Store(false)
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+	}
+}
+
+func mustUnixSend(t *testing.T, fd int, payload []byte) {
+	t.Helper()
+	if err := unix.Send(fd, payload, 0); err != nil {
+		n, sendErr := unix.Write(fd, payload)
+		if sendErr != nil || n != len(payload) {
+			t.Fatalf("send datagram: send=%v write=%v n=%d", err, sendErr, n)
+		}
+	}
+}
+
 func mustListenDirectReceiverUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -130,12 +157,57 @@ func assertDirectReceiverPacket(t *testing.T, packets <-chan *netproxy.ReceivedP
 		if string(packet.Data) != wantData {
 			t.Fatalf("received packet data = %q, want %q", packet.Data, wantData)
 		}
-		if packet.From != wantFrom {
+		if !wantFrom.IsValid() {
+			// Unix-datagram injection has no IP peer.
+		} else if packet.From != wantFrom {
 			t.Fatalf("received packet from = %s, want %s", packet.From, wantFrom)
 		}
-		packet.Release()
 		packet.Release()
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for %q", wantData)
 	}
+}
+
+func TestDirectPacketReceiverDeliversBelow8KiBOnSmallTier(t *testing.T) {
+	if directPacketReceiverSmallBufferSize < 8192 {
+		t.Fatalf("small tier = %d, want >= 8192", directPacketReceiverSmallBufferSize)
+	}
+	entry, peer, cleanup := newUnixDatagramReceiverEntry(t)
+	defer cleanup()
+
+	packets := make(chan *netproxy.ReceivedPacket, 2)
+	entry.handler = func(packet *netproxy.ReceivedPacket) bool {
+		packets <- packet
+		return true
+	}
+
+	small := bytes.Repeat([]byte("a"), 1200)
+	mid := bytes.Repeat([]byte("b"), 3000)
+	mustUnixSend(t, peer, small)
+	defaultPacketReceiverRegistry.drain(entry)
+	assertDirectReceiverPacket(t, packets, string(small), netip.AddrPort{})
+	mustUnixSend(t, peer, mid)
+	defaultPacketReceiverRegistry.drain(entry)
+	assertDirectReceiverPacket(t, packets, string(mid), netip.AddrPort{})
+}
+
+func TestDirectPacketReceiverDeliversFirstJumboDatagram(t *testing.T) {
+	entry, peer, cleanup := newUnixDatagramReceiverEntry(t)
+	defer cleanup()
+
+	packets := make(chan *netproxy.ReceivedPacket, 2)
+	entry.handler = func(packet *netproxy.ReceivedPacket) bool {
+		packets <- packet
+		return true
+	}
+
+	jumbo := bytes.Repeat([]byte("z"), 20000)
+	mustUnixSend(t, peer, jumbo)
+	defaultPacketReceiverRegistry.drain(entry)
+	assertDirectReceiverPacket(t, packets, string(jumbo), netip.AddrPort{})
+
+	small := bytes.Repeat([]byte("s"), 512)
+	mustUnixSend(t, peer, small)
+	defaultPacketReceiverRegistry.drain(entry)
+	assertDirectReceiverPacket(t, packets, string(small), netip.AddrPort{})
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
@@ -25,11 +26,13 @@ const maxMeekResponseBodySize = 1 << 20
 func meekRoundTripperCacheKey(scope, addr, url string, tlsConfig *tls.Config) string {
 	serverName := ""
 	insecure := false
+	nextProtos := ""
 	if tlsConfig != nil {
 		serverName = tlsConfig.ServerName
 		insecure = tlsConfig.InsecureSkipVerify
+		nextProtos = strings.Join(tlsConfig.NextProtos, "\x01")
 	}
-	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t", scope, addr, url, serverName, insecure)
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t\x00%s", scope, addr, url, serverName, insecure, nextProtos)
 }
 
 type httpTripperClient struct {
@@ -37,22 +40,6 @@ type httpTripperClient struct {
 	nextDialer netproxy.Dialer
 	tlsConfig  *tls.Config
 	url        string
-}
-
-func CleanGlobalRoundTripperCache() {
-	globalRoundTripperCacheAccess.Lock()
-	cached := make([]http.RoundTripper, 0, len(globalRoundTripperCacheMap))
-	for _, rt := range globalRoundTripperCacheMap {
-		cached = append(cached, rt)
-	}
-	globalRoundTripperCacheMap = make(map[string]http.RoundTripper)
-	globalRoundTripperCacheAccess.Unlock()
-
-	for _, rt := range cached {
-		if closeIdler, ok := rt.(interface{ CloseIdleConnections() }); ok {
-			closeIdler.CloseIdleConnections()
-		}
-	}
 }
 
 func CleanScopedRoundTripperCache(scope string) {
@@ -134,6 +121,12 @@ func (c *httpTripperClient) getRoundTripper() http.RoundTripper {
 				}, nil
 			},
 			TLSClientConfig: c.tlsConfig,
+			// The cache is keyed per destination and nothing in this repo
+			// reaps transports, so without an idle timeout every transport
+			// would pin its TLS connections (and their read/write
+			// goroutines) for the process lifetime.
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
 		}
 	}
 	return globalRoundTripperCacheMap[cacheKey]

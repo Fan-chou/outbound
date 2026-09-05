@@ -70,7 +70,7 @@ func TestPutNonPowerOf2Cap(t *testing.T) {
 	Put(small)
 }
 
-func TestGetMustBiggerBug(t *testing.T) {
+func TestGetBucketCapacityBug(t *testing.T) {
 	testCases := []struct {
 		size        int
 		expectedCap int
@@ -84,7 +84,7 @@ func TestGetMustBiggerBug(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.description, func(t *testing.T) {
-			buf := GetMustBigger(tc.size)
+			buf := Get(tc.size)
 			defer buf.Put()
 
 			actualCap := cap(buf)
@@ -133,7 +133,7 @@ func TestPoolInitialization(t *testing.T) {
 // 重新切片到桶大小，导致 slice bounds panic。
 func TestPool_PutNonPowerOfTwoCapDoesNotPolluteBucket(t *testing.T) {
 	// 模拟 append 增长产生的非 2 幂 cap（如 socks5 认证分支撑破 512 → ~832）。
-	polluter := make([]byte, 512, 512)
+	polluter := make([]byte, 512)
 	polluter = append(polluter, make([]byte, 300)...)
 	if cap(polluter)&(cap(polluter)-1) == 0 {
 		t.Fatalf("test setup: expected non-power-of-2 cap, got %d", cap(polluter))

@@ -80,13 +80,13 @@ type Conn struct {
 	// the write path (under muWrite); without a dedicated lock the two paths
 	// race on the shared state. Acquired only inside FilterTLS/filterSnapshot,
 	// never nested with muRead/muWrite, so lock ordering is single-level.
-	filterMu                  sync.Mutex
-	packetsToFilter           int
-	isTLS                     bool
-	isTLS12orAbove            bool
-	enableXTLS                bool
-	cipher                    uint16
-	remainingServerHello      uint16
+	filterMu             sync.Mutex
+	packetsToFilter      int
+	isTLS                bool
+	isTLS12orAbove       bool
+	enableXTLS           bool
+	cipher               uint16
+	remainingServerHello uint16
 }
 
 func (vc *Conn) Read(b []byte) (int, error) {
@@ -96,6 +96,18 @@ func (vc *Conn) Read(b []byte) (int, error) {
 		return vc.reader.Read(b)
 	}
 	return vc.read(b)
+}
+
+func (vc *Conn) CloseWrite() error {
+	vc.muWrite.Lock()
+	defer vc.muWrite.Unlock()
+	if vc.toWriteDirect {
+		if tcp, ok := vc.Conn.(*net.TCPConn); ok {
+			return tcp.CloseWrite()
+		}
+		return nil
+	}
+	return netproxy.ForwardCloseWrite(vc.overlayConn)
 }
 
 func isTCPConnUnixConn(conn any) bool {

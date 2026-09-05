@@ -17,19 +17,11 @@ const (
 
 var (
 	// pools is the general-purpose byte-buffer pool, bucketed by power-of-2
-	// size. It uses sync.Pool deliberately: it serves many protocols and call
-	// sites (ciphers, anytls, juicity, bufio, direct), so per-bucket churn is
-	// spread out, and sync.Pool's lock-free per-P fast path wins on throughput.
-	// sync.Pool is cleared each GC cycle; that is acceptable here because these
-	// buffers are short-lived and the aggregate allocation rate is bounded by
-	// traffic, not by a single hot per-packet loop.
-	//
-	// The genuinely hot, per-packet serialization paths that would feed a GC
-	// spiral under sync.Pool (tuic/juicity framing, hy2 UDP hop) use dedicated
-	// GC-stable pools instead — see pool/bytes_buffer.go (LIFO stack) and
-	// protocol/hysteria2/udphop/conn.go hopBufPool (bounded channel). Do not
-	// "unify" those onto sync.Pool without a benchmark showing the GC-clear
-	// behavior is harmless under load.
+	// size. sync.Pool provides per-P caches and a one-GC victim cache, while the
+	// runtime may discard entries at any time. It reduces common-case allocation
+	// without promising deterministic retention, lock freedom, or GC behavior.
+	// Specialized bounded pools require workload-level evidence rather than
+	// assumptions about either implementation.
 	pools [num]sync.Pool
 )
 
@@ -42,16 +34,12 @@ func init() {
 	}
 }
 
-func GetClosestN(need int) (n int) {
-	// if need is exactly 2^n, return n-1
-	if need&(need-1) == 0 {
-		return bits.Len32(uint32(need)) - 1
-	}
-	// or return its closest n
-	return bits.Len32(uint32(need))
-}
-
 func GetBiggerClosestN(need int) (n int) {
+	if need <= 0 {
+		// bits.Len32(0) is 0, which would make the power-of-two check below
+		// shift by a negative count and panic; clamp to the smallest bucket.
+		return minsizePower
+	}
 	n = bits.Len32(uint32(need))
 	// bits.Len32 returns the number of bits needed to represent the number.
 	// For a power of 2, it returns exponent+1, so we subtract 1.
@@ -92,21 +80,6 @@ func GetFullCap(size int) PB {
 	a := Get(size)
 	a = a[:cap(a)]
 	return a
-}
-
-func GetMustBigger(size int) PB {
-	if size >= 1 && size <= maxsize {
-		i := GetBiggerClosestN(size)
-		if i < minsizePower {
-			i = minsizePower
-		}
-		b := pools[i].Get().([]byte)
-		if cap(b) < size {
-			return make([]byte, size)
-		}
-		return b[:size]
-	}
-	return make([]byte, size)
 }
 
 func GetZero(size int) []byte {

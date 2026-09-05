@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -88,10 +89,16 @@ type ClientConn struct {
 	closer    context.CancelFunc
 	muReading sync.Mutex // muReading protects reading
 	muWriting sync.Mutex // muWriting protects writing
-	muRecv    sync.Mutex // muReading protects recv
-	muSend    sync.Mutex // muWriting protects send
+	muSend    sync.Mutex // muSend serializes stream sends
 	buf       []byte
 	offset    int
+
+	// recvCh is fed by a single lazily-started receive pump so an abandoned
+	// deadline-expired Read cannot lose a received hunk (a per-Read Recv
+	// goroutine whose buffered(1) result channel nobody drains anymore).
+	recvCh   chan RecvResp
+	pumpOnce sync.Once
+	recvErr  error
 
 	deadlineMu    sync.Mutex
 	readDeadline  *time.Timer
@@ -103,6 +110,42 @@ type ClientConn struct {
 	cancelWrite func()
 	ctx         context.Context
 	cancel      func()
+}
+
+// readCtx snapshots the current read-deadline context under deadlineMu: the
+// Set*Deadline methods replace ctxRead/ctxWrite concurrently, and selecting
+// on the field without the lock is a data race.
+func (c *ClientConn) readCtx() context.Context {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return c.ctxRead
+}
+
+func (c *ClientConn) writeCtx() context.Context {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return c.ctxWrite
+}
+
+// ensureRecvPump starts the single receive pump goroutine. It exits when the
+// stream context is done or Recv reports a terminal error.
+func (c *ClientConn) ensureRecvPump() {
+	c.pumpOnce.Do(func() {
+		c.recvCh = make(chan RecvResp, 1)
+		go func() {
+			for {
+				recv, e := c.tun.Recv()
+				select {
+				case c.recvCh <- RecvResp{hunk: recv, err: e}:
+				case <-c.ctx.Done():
+					return
+				}
+				if e != nil {
+					return
+				}
+			}
+		}()
+	})
 }
 
 func NewClientConn(tun proto.GunService_TunClient, closer context.CancelFunc) *ClientConn {
@@ -127,9 +170,13 @@ type RecvResp struct {
 }
 
 func (c *ClientConn) Read(p []byte) (n int, err error) {
+	c.ensureRecvPump()
+	ctxRead := c.readCtx()
 	select {
-	case <-c.ctxRead.Done():
-		c.closer() // Cancel stream context so the Recv goroutine can exit
+	case <-ctxRead.Done():
+		// Deadline expiry is NOT terminal: the pending Recv keeps running in
+		// the pump and its result stays queued in recvCh for the next Read
+		// after the caller clears or extends the deadline.
 		return 0, os.ErrDeadlineExceeded
 	case <-c.ctx.Done():
 		return 0, io.EOF
@@ -138,6 +185,12 @@ func (c *ClientConn) Read(p []byte) (n int, err error) {
 
 	c.muReading.Lock()
 	defer c.muReading.Unlock()
+	if c.recvErr != nil {
+		return 0, c.recvErr
+	}
+	// Refresh after acquiring the read lock so deadline changes made while
+	// this operation waited for another reader apply to the pending I/O.
+	ctxRead = c.readCtx()
 	if c.buf != nil {
 		n = copy(p, c.buf[c.offset:])
 		c.offset += n
@@ -147,44 +200,37 @@ func (c *ClientConn) Read(p []byte) (n int, err error) {
 		}
 		return n, nil
 	}
-	// set 1 to avoid channel leak
-	readDone := make(chan RecvResp, 1)
-	// pass channel to the function to avoid closure leak
-	go func(readDone chan RecvResp) {
-		// FIXME: not really abort the send so there is some problems when recover
-		c.muRecv.Lock()
-		defer c.muRecv.Unlock()
-		recv, e := c.tun.Recv()
-		readDone <- RecvResp{
-			hunk: recv,
-			err:  e,
-		}
-	}(readDone)
 	select {
-	case <-c.ctxRead.Done():
-		c.closer() // Cancel stream context so the Recv goroutine can exit
+	case <-ctxRead.Done():
 		return 0, os.ErrDeadlineExceeded
 	case <-c.ctx.Done():
 		return 0, io.EOF
-	case recvResp := <-readDone:
+	case recvResp := <-c.recvCh:
 		err = recvResp.err
 		if err != nil {
 			if code := status.Code(err); code == codes.Unavailable || status.Code(err) == codes.OutOfRange {
 				err = io.EOF
 			}
+			c.recvErr = err
 			return 0, err
 		}
 		n = copy(p, recvResp.hunk.Data)
-		c.buf = pool.Get(len(recvResp.hunk.Data) - n)
-		copy(c.buf, recvResp.hunk.Data[n:])
-		c.offset = 0
+		if rest := len(recvResp.hunk.Data) - n; rest > 0 {
+			// A zero-length remainder must not be stored: an empty
+			// non-nil buf made the next Read return (0, nil), one
+			// spurious iteration per fully-consumed hunk.
+			c.buf = pool.Get(rest)
+			copy(c.buf, recvResp.hunk.Data[n:])
+			c.offset = 0
+		}
 		return n, nil
 	}
 }
 
 func (c *ClientConn) Write(p []byte) (n int, err error) {
+	ctxWrite := c.writeCtx()
 	select {
-	case <-c.ctxWrite.Done():
+	case <-ctxWrite.Done():
 		return 0, os.ErrDeadlineExceeded
 	case <-c.ctx.Done():
 		return 0, io.EOF
@@ -193,18 +239,25 @@ func (c *ClientConn) Write(p []byte) (n int, err error) {
 
 	c.muWriting.Lock()
 	defer c.muWriting.Unlock()
+	// Refresh after acquiring the write lock so deadline changes made while
+	// this operation waited for another writer apply to the pending I/O.
+	ctxWrite = c.writeCtx()
 	// set 1 to avoid channel leak
 	sendDone := make(chan error, 1)
 	// pass channel to the function to avoid closure leak
 	go func(sendDone chan error) {
-		// FIXME: not really abort the send so there is some problems when recover
 		c.muSend.Lock()
 		defer c.muSend.Unlock()
 		e := c.tun.Send(&proto.Hunk{Data: p})
 		sendDone <- e
 	}(sendDone)
 	select {
-	case <-c.ctxWrite.Done():
+	case <-ctxWrite.Done():
+		// A wedged gRPC Send cannot be aborted or bypassed, and a second
+		// Send must not overtake it (that would reorder stream data), so
+		// cancelling the stream is the only way to unblock writers. Write
+		// deadlines are therefore terminal for this conn, unlike read
+		// deadlines above.
 		c.closer() // Cancel stream context so the Send goroutine can exit
 		return 0, os.ErrDeadlineExceeded
 	case <-c.ctx.Done():
@@ -217,7 +270,48 @@ func (c *ClientConn) Write(p []byte) (n int, err error) {
 	}
 }
 
+// setDeadlineLocked updates one direction while preserving the context used by
+// pending I/O. Only an expired context needs replacing. Caller holds deadlineMu.
+func (c *ClientConn) setDeadlineLocked(slot **time.Timer, ctx *context.Context, cancel *func(), t time.Time) {
+	if *slot != nil {
+		(*slot).Stop()
+		*slot = nil
+	}
+	if !t.IsZero() && !t.After(time.Now()) {
+		(*cancel)()
+		return
+	}
+	if (*ctx).Err() != nil {
+		*ctx, *cancel = context.WithCancel(context.Background())
+	}
+	if t.IsZero() {
+		return
+	}
+	cancelDeadline := *cancel
+	var timer *time.Timer
+	timer = time.AfterFunc(time.Until(t), func() {
+		c.deadlineMu.Lock()
+		defer c.deadlineMu.Unlock()
+		// Stop does not wait for a callback already blocked on deadlineMu.
+		// The slot identity prevents that old epoch from cancelling new I/O.
+		if *slot == timer {
+			cancelDeadline()
+		}
+	})
+	*slot = timer
+}
+
 func (c *ClientConn) Close() error {
+	c.deadlineMu.Lock()
+	if c.readDeadline != nil {
+		c.readDeadline.Stop()
+		c.readDeadline = nil
+	}
+	if c.writeDeadline != nil {
+		c.writeDeadline.Stop()
+		c.writeDeadline = nil
+	}
+	c.deadlineMu.Unlock()
 	select {
 	case <-c.ctx.Done():
 	default:
@@ -226,6 +320,7 @@ func (c *ClientConn) Close() error {
 	c.closer()
 	return nil
 }
+
 func (c *ClientConn) CloseWrite() error {
 	return c.tun.CloseSend()
 }
@@ -233,121 +328,22 @@ func (c *ClientConn) CloseWrite() error {
 func (c *ClientConn) SetDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxRead.Done():
-			c.ctxRead, c.cancelRead = context.WithCancel(context.Background())
-
-		default:
-		}
-		select {
-		case <-c.ctxWrite.Done():
-			c.ctxWrite, c.cancelWrite = context.WithCancel(context.Background())
-		default:
-		}
-		// reset the deadline timer
-		if c.readDeadline != nil {
-			c.readDeadline.Stop()
-		}
-		c.readDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxRead.Done():
-			default:
-				c.cancelRead()
-			}
-		})
-		if c.writeDeadline != nil {
-			c.writeDeadline.Stop()
-		}
-		c.writeDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxWrite.Done():
-			default:
-				c.cancelWrite()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxRead.Done():
-		default:
-			c.cancelRead()
-		}
-		select {
-		case <-c.ctxWrite.Done():
-		default:
-			c.cancelWrite()
-		}
-	}
+	c.setDeadlineLocked(&c.readDeadline, &c.ctxRead, &c.cancelRead, t)
+	c.setDeadlineLocked(&c.writeDeadline, &c.ctxWrite, &c.cancelWrite, t)
 	return nil
 }
 
 func (c *ClientConn) SetReadDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxRead.Done():
-			c.ctxRead, c.cancelRead = context.WithCancel(context.Background())
-		default:
-		}
-		// reset the deadline timer
-		if c.readDeadline != nil {
-			c.readDeadline.Stop()
-		}
-		c.readDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxRead.Done():
-			default:
-				c.cancelRead()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxRead.Done():
-		default:
-			c.cancelRead()
-		}
-	}
+	c.setDeadlineLocked(&c.readDeadline, &c.ctxRead, &c.cancelRead, t)
 	return nil
 }
 
 func (c *ClientConn) SetWriteDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxWrite.Done():
-			c.ctxWrite, c.cancelWrite = context.WithCancel(context.Background())
-		default:
-		}
-		if c.writeDeadline != nil {
-			c.writeDeadline.Stop()
-		}
-		c.writeDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxWrite.Done():
-			default:
-				c.cancelWrite()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxWrite.Done():
-		default:
-			c.cancelWrite()
-		}
-	}
+	c.setDeadlineLocked(&c.writeDeadline, &c.ctxWrite, &c.cancelWrite, t)
 	return nil
 }
 
@@ -379,31 +375,66 @@ func (d *Dialer) DialContext(ctx context.Context, network string, address string
 	if serviceName == "" {
 		serviceName = "GunService"
 	}
-	// ctx is the lifetime of the tun
+	// Stream lifetime is independent of the dial ctx (dae cancels dial ctx
+	// after Dial returns). Honor the caller ctx only while Tun is opening.
 	ctxStream, streamCloser := context.WithCancel(context.Background())
+	stopWatch := context.AfterFunc(ctx, streamCloser)
 	tun, err := clientX.TunCustomName(ctxStream, serviceName)
 	if err != nil {
+		_ = stopWatch()
 		streamCloser()
 		return nil, err
 	}
+	if !stopWatch() {
+		streamCloser()
+		_ = tun.CloseSend()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, context.Canceled
+	}
 	return NewClientConn(tun, streamCloser), nil
+}
+
+// systemCertPoolCached resolves the system pool once: GetSystemCertPool is
+// not free and previously ran on every dial, even on cache-hit paths.
+var (
+	systemCertPoolMu  sync.Mutex
+	systemCertPool    *x509.CertPool
+	systemCertPoolErr error
+)
+
+// Success is memoized; a failure (e.g. CA bundle briefly missing at cold
+// start) must stay retryable or every gRPC dial fails until restart.
+func systemCertPoolCached() (*x509.CertPool, error) {
+	systemCertPoolMu.Lock()
+	defer systemCertPoolMu.Unlock()
+	if systemCertPool != nil {
+		return systemCertPool, nil
+	}
+	systemCertPool, systemCertPoolErr = cert.GetSystemCertPool()
+	return systemCertPool, systemCertPoolErr
 }
 
 func getGrpcClientConn(ctx context.Context, tcpDialer netproxy.Dialer, serverName string, address string, allowInsecure bool, somark uint32, mptcp bool) (*clientConnMeta, ccCanceller, error) {
 	scope := netproxy.TransportCacheNamespace(tcpDialer)
 	cacheKey := grpcClientCacheKey(scope, serverName, address, allowInsecure, somark, mptcp)
 	// allowInsecure?
-	roots, err := cert.GetSystemCertPool()
+	roots, err := systemCertPoolCached()
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("failed to get system certificate pool")
 	}
 	certOption := grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{ServerName: serverName, RootCAs: roots, InsecureSkipVerify: allowInsecure}))
 
+	// Hold the cache lock across lookup, dial and store: grpc.DialContext is
+	// lazy (it does not wait for the connection), and doing the dial outside
+	// the lock let two concurrent dials for the same key both miss, both
+	// connect, and orphan the loser's connection.
 	globalCCAccess.Lock()
+	defer globalCCAccess.Unlock()
 	if globalCCMap == nil {
 		globalCCMap = make(map[string]*clientConnMeta)
 	}
-	globalCCAccess.Unlock()
 
 	var meta *clientConnMeta
 	canceller := func() {
@@ -418,12 +449,9 @@ func getGrpcClientConn(ctx context.Context, tcpDialer netproxy.Dialer, serverNam
 	}
 
 	// TODO Should support chain proxy to the same destination
-	globalCCAccess.Lock()
 	if meta, found := globalCCMap[cacheKey]; found && meta.cc.GetState() != connectivity.Shutdown {
-		globalCCAccess.Unlock()
 		return meta, canceller, nil
 	}
-	globalCCAccess.Unlock()
 	meta = &clientConnMeta{
 		cc: nil,
 	}
@@ -461,8 +489,6 @@ func getGrpcClientConn(ctx context.Context, tcpDialer netproxy.Dialer, serverNam
 	if err != nil {
 		return nil, canceller, err
 	}
-	globalCCAccess.Lock()
 	globalCCMap[cacheKey] = meta
-	globalCCAccess.Unlock()
 	return meta, canceller, err
 }

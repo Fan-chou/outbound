@@ -23,35 +23,17 @@ func (s *closeIdleSpyRoundTripper) CloseIdleConnections() {
 	s.closeCalls.Add(1)
 }
 
-func TestCleanGlobalRoundTripperCacheClosesIdleConnections(t *testing.T) {
-	globalRoundTripperCacheAccess.Lock()
-	original := globalRoundTripperCacheMap
-	globalRoundTripperCacheMap = nil
-	globalRoundTripperCacheAccess.Unlock()
-	t.Cleanup(func() {
-		globalRoundTripperCacheAccess.Lock()
-		globalRoundTripperCacheMap = original
-		globalRoundTripperCacheAccess.Unlock()
-	})
+func TestMeekRoundTripperCacheKeyIncludesALPN(t *testing.T) {
+	base := &tls.Config{ServerName: "edge.example"}
+	h2 := base.Clone()
+	h2.NextProtos = []string{"h2"}
+	http1 := base.Clone()
+	http1.NextProtos = []string{"http/1.1"}
 
-	spy := &closeIdleSpyRoundTripper{}
-
-	globalRoundTripperCacheAccess.Lock()
-	globalRoundTripperCacheMap = map[string]http.RoundTripper{
-		"test": spy,
-	}
-	globalRoundTripperCacheAccess.Unlock()
-
-	CleanGlobalRoundTripperCache()
-
-	if got := spy.closeCalls.Load(); got != 1 {
-		t.Fatalf("CloseIdleConnections called %d times, want 1", got)
-	}
-
-	globalRoundTripperCacheAccess.Lock()
-	defer globalRoundTripperCacheAccess.Unlock()
-	if len(globalRoundTripperCacheMap) != 0 {
-		t.Fatalf("global round tripper cache size = %d, want 0", len(globalRoundTripperCacheMap))
+	keyH2 := meekRoundTripperCacheKey("scope", "proxy:443", "https://edge.example", h2)
+	keyHTTP1 := meekRoundTripperCacheKey("scope", "proxy:443", "https://edge.example", http1)
+	if keyH2 == keyHTTP1 {
+		t.Fatal("cache key shared transports with different ALPN")
 	}
 }
 

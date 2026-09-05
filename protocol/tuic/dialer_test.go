@@ -71,8 +71,8 @@ func TestTcp(t *testing.T) {
 	}
 }
 
-func TestTcpReturnsErrorWhenRemoteConnectFailsImmediately(t *testing.T) {
-	server := startTestTUICServer(t, testTUICPassword)
+func TestTcpReturnsStreamLocalErrorAfterImmediateDialSuccess(t *testing.T) {
+	server := startTestTUICServer(t, testTUICPassword, true)
 	defer server.Close()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -86,12 +86,36 @@ func TestTcpReturnsErrorWhenRemoteConnectFailsImmediately(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	conn, err := dialer.DialContext(ctx, "tcp", backendAddr)
-	if err == nil {
-		if conn != nil {
-			_ = conn.Close()
-		}
-		t.Fatal("DialContext() error = nil, want remote connect failure")
+	type dialResult struct {
+		conn netproxy.Conn
+		err  error
+	}
+	dialResultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.DialContext(ctx, "tcp", backendAddr)
+		dialResultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case <-server.connectRequest:
+	case <-ctx.Done():
+		t.Fatal("server did not receive CONNECT command")
+	}
+
+	var result dialResult
+	select {
+	case result = <-dialResultCh:
+	case <-ctx.Done():
+		t.Fatal("DialContext waited for remote connection confirmation")
+	}
+	if result.err != nil {
+		t.Fatalf("DialContext() error = %v, want immediate stream", result.err)
+	}
+	defer result.conn.Close()
+
+	close(server.connectGate)
+	if _, err := result.conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("stream read error = nil, want remote connect failure")
 	}
 }
 
@@ -153,11 +177,13 @@ type testTUICServer struct {
 	listener *quic.Listener
 	password string
 
-	conns sync.Map
-	done  chan struct{}
+	conns          sync.Map
+	done           chan struct{}
+	connectRequest chan struct{}
+	connectGate    chan struct{}
 }
 
-func startTestTUICServer(t *testing.T, password string) *testTUICServer {
+func startTestTUICServer(t *testing.T, password string, blockConnect ...bool) *testTUICServer {
 	t.Helper()
 
 	listener, err := quic.ListenAddr("127.0.0.1:0", newTestServerTLSConfig(t), &quic.Config{
@@ -172,6 +198,10 @@ func startTestTUICServer(t *testing.T, password string) *testTUICServer {
 		listener: listener,
 		password: password,
 		done:     make(chan struct{}),
+	}
+	if len(blockConnect) > 0 && blockConnect[0] {
+		s.connectRequest = make(chan struct{}, 1)
+		s.connectGate = make(chan struct{})
 	}
 	go func() {
 		defer close(s.done)
@@ -264,6 +294,14 @@ func (s *testTUICServer) serveConnectStreams(conn quic.Connection) {
 			if err != nil {
 				_ = conn.CloseWithError(BadCommand, err.Error())
 				return
+			}
+			if s.connectGate != nil {
+				s.connectRequest <- struct{}{}
+				select {
+				case <-s.connectGate:
+				case <-conn.Context().Done():
+					return
+				}
 			}
 
 			targetConn, err := net.Dial("tcp", connect.ADDR.String())

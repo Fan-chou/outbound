@@ -38,19 +38,15 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 	// ensure server's incoming stream can handle correctly, increase to 1.1x
 	maxDatagramFrameSize := 1452 // = quic-go MaxPacketBufferSize (Ethernet PMTU)
+	// UdpRelayMode is intentionally pinned to NATIVE: the QUIC unistream
+	// relay mode has known throughput problems and is not selectable from
+	// configuration. The ClientOption field and the packet.go QUIC branch
+	// stay for API compatibility.
 	udpRelayMode := common.NATIVE
-	if header.Flags&protocol.Flags_Tuic_UdpRelayModeQuic > 0 {
-		_ = header // avoid empty branch warning
-		// FIXME: QUIC has severe performance problems.
-		// udpRelayMode = common.QUIC
-	}
 	// cwnd doubles as the brutal congestion controller's target bandwidth
 	// (bytes per second) when congestion_control=brutal; 0 lets the
 	// controller fall back to BBR.
-	cwnd := 0
-	if v, ok := header.Feature2.(int); ok {
-		cwnd = v
-	}
+	cwnd := common.CWNDFromFeature(header.Feature2)
 	proxyUDPAddr, err := net.ResolveUDPAddr("udp", header.ProxyAddress)
 	if err != nil {
 		return nil, err
@@ -76,7 +72,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 					UdpRelayMode:          udpRelayMode,
 					CongestionController:  header.Feature1.(string),
 					ReduceRtt:             true, // 0-RTT cuts cold-start RTT
-					CWND:                  uint64(cwnd),
+					CWND:                  cwnd,
 					MaxUdpRelayPacketSize: maxDatagramFrameSize,
 				},
 				udp:       true,
@@ -101,7 +97,10 @@ func (d *Dialer) dialFuncFactory(udpNetwork string, rAddr net.Addr) common.DialF
 			net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
 			rAddr,
 		)
-		transport = &quic.Transport{Conn: pc}
+		transport = &quic.Transport{
+			Conn:               pc,
+			DisableAddrParsing: true,
+		}
 		return transport, rAddr, nil
 	}
 }

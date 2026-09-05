@@ -15,7 +15,12 @@ import (
 
 const (
 	directPacketReceiverBufferSize = 65535
-	directPacketReceiverBatchSize  = 64
+	// Small tier covers EDNS/DNSSEC and almost all QUIC initial/handshake
+	// datagrams. The receiver peeks only the datagram length, then consumes it
+	// into the smallest fitting tier so a queue never permanently pins 64 KiB
+	// buffers and the first jumbo datagram is preserved.
+	directPacketReceiverSmallBufferSize = 8192
+	directPacketReceiverBatchSize       = 64
 )
 
 // packetReceiverRegistry multiplexes direct UDP sockets through one Linux
@@ -166,7 +171,26 @@ func (r *packetReceiverRegistry) drain(entry *directPacketReceiverEntry) {
 		if !entry.active.Load() {
 			return
 		}
-		buf := pool.GetFullCap(directPacketReceiverBufferSize)
+		var peek [1]byte
+		packetLen, _, err := unix.Recvfrom(entry.fd, peek[:], unix.MSG_DONTWAIT|unix.MSG_PEEK|unix.MSG_TRUNC)
+		if err != nil {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
+				if err == unix.EINTR {
+					continue
+				}
+				return
+			}
+			r.deliverError(entry, err)
+			return
+		}
+		bufSize := directPacketReceiverSmallBufferSize
+		if packetLen > bufSize {
+			bufSize = packetLen
+			if bufSize > directPacketReceiverBufferSize {
+				bufSize = directPacketReceiverBufferSize
+			}
+		}
+		buf := pool.GetFullCap(bufSize)
 		n, sockaddr, err := unix.Recvfrom(entry.fd, buf, unix.MSG_DONTWAIT)
 		if err != nil {
 			pool.Put(buf)
@@ -228,6 +252,15 @@ func directPacketReceiverAddrPort(sockaddr unix.Sockaddr) (netip.AddrPort, bool)
 		return netip.AddrPortFrom(netip.AddrFrom4(addr.Addr), uint16(addr.Port)), true
 	case *unix.SockaddrInet6:
 		return netip.AddrPortFrom(netip.AddrFrom16(addr.Addr), uint16(addr.Port)), true
+	case *unix.SockaddrUnix:
+		// Production sockets are UDP; unnamed unix datagrams are used by
+		// tests to inject oversize payloads past this environment's
+		// loopback UDP ~1472-byte ceiling.
+		return netip.AddrPort{}, true
+	case nil:
+		// Recvfrom on a connected socket (including SOCK_DGRAM socketpair)
+		// reports no peer address.
+		return netip.AddrPort{}, true
 	default:
 		return netip.AddrPort{}, false
 	}

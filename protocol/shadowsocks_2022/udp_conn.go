@@ -349,8 +349,14 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 	if !c.checkContextAndSetWriteDeadline() {
 		return 0, io.EOF
 	}
-	_, err = c.Write(packet)
-	return len(b), err
+	n, err := c.Write(packet)
+	if err != nil {
+		return 0, err
+	}
+	if n < len(packet) {
+		return 0, io.ErrShortWrite
+	}
+	return len(b), nil
 }
 
 func (c *UdpConn) writeToChacha(b []byte, addr string) (int, error) {
@@ -415,8 +421,14 @@ func (c *UdpConn) writeToChacha(b []byte, addr string) (int, error) {
 	if !c.checkContextAndSetWriteDeadline() {
 		return 0, io.EOF
 	}
-	_, err = c.Write(packet)
-	return len(b), err
+	n, err := c.Write(packet)
+	if err != nil {
+		return 0, err
+	}
+	if n < len(packet) {
+		return 0, io.ErrShortWrite
+	}
+	return len(b), nil
 }
 
 func (c *UdpConn) targetAddrInfo(addr string) (socks5.AddressInfo, error) {
@@ -502,10 +514,12 @@ func (c *UdpConn) decodeBlockPacket(buf []byte, now time.Time) ([]byte, netip.Ad
 	var sessionID [8]byte
 	copy(sessionID[:], buf[:8])
 	packetID := binary.BigEndian.Uint64(buf[8:16])
-	if !c.checkAndUpdateReplay(sessionID, packetID, now) {
-		return nil, netip.AddrPort{}, protocol.ErrReplayAttack
-	}
 
+	// Authenticate before committing anti-replay state (the same order the
+	// chacha path below uses): the separate header carries no integrity of
+	// its own, so committing the replay window first would let anyone who
+	// knows a session ID push the window forward and permanently reject the
+	// victim's later legitimate packets.
 	payload := buf[16:]
 	sessionCipher, err := c.decryptCipherFor(sessionID)
 	if err != nil {
@@ -514,6 +528,9 @@ func (c *UdpConn) decodeBlockPacket(buf []byte, now time.Time) ([]byte, netip.Ad
 	payload, err = sessionCipher.Open(payload[:0], buf[4:16], payload, nil)
 	if err != nil {
 		return nil, netip.AddrPort{}, err
+	}
+	if !c.checkAndUpdateReplay(sessionID, packetID, now) {
+		return nil, netip.AddrPort{}, protocol.ErrReplayAttack
 	}
 	return c.decodePacketPayload(buf, payload, now)
 }

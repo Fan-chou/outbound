@@ -1,10 +1,8 @@
 package shadowsocks
 
 import (
-	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -15,7 +13,6 @@ import (
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
 	disk_bloom "github.com/mzz2017/disk-bloom"
-	"golang.org/x/crypto/hkdf"
 )
 
 // [LEGACY] Global switch for UDP cipher cache optimization (kept for reference):
@@ -84,27 +81,7 @@ func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.
 			return packet, true
 		}
 	}
-	sizeMetadata, err := BytesSizeForMetadata(decoded[:n])
-	if err != nil {
-		decoded.Put()
-		packet.Err = err
-		packet.Data = nil
-		return packet, true
-	}
-	mdata, err := NewMetadata(decoded[:n])
-	if err != nil {
-		decoded.Put()
-		packet.Err = err
-		packet.Data = nil
-		return packet, true
-	}
-	if mdata.Type != protocol.MetadataTypeIPv4 && mdata.Type != protocol.MetadataTypeIPv6 {
-		decoded.Put()
-		packet.Err = fmt.Errorf("bad metadata type: %v; should be ip", mdata.Type)
-		packet.Data = nil
-		return packet, true
-	}
-	ip, err := netip.ParseAddr(mdata.Hostname)
+	payload, from, err := splitDecryptedUdp(decoded[:n])
 	if err != nil {
 		decoded.Put()
 		packet.Err = err
@@ -112,14 +89,37 @@ func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.
 		return packet, true
 	}
 	return netproxy.NewReceivedPacket(
-		decoded[sizeMetadata:n],
-		netip.AddrPortFrom(ip, mdata.Port),
+		payload,
+		from,
 		nil,
 		func() { decoded.Put() },
 	), true
 }
 
 var parseMetadata = protocol.ParseMetadata
+
+// splitDecryptedUdp splits one decrypted legacy-SS UDP payload into the
+// reply payload and its source address. Shared by the polling ReadFrom and
+// the push-mode receiver so the two decode paths cannot drift.
+func splitDecryptedUdp(plain []byte) (payload []byte, from netip.AddrPort, err error) {
+	sizeMetadata, err := BytesSizeForMetadata(plain)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	mdata, err := NewMetadata(plain)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	switch mdata.Type {
+	case protocol.MetadataTypeIPv4, protocol.MetadataTypeIPv6:
+		if !mdata.IP.IsValid() {
+			return nil, netip.AddrPort{}, fmt.Errorf("ip metadata without a parsed address (type %v)", mdata.Type)
+		}
+	default:
+		return nil, netip.AddrPort{}, fmt.Errorf("bad metadata type: %v; should be ip", mdata.Type)
+	}
+	return plain[sizeMetadata:], netip.AddrPortFrom(mdata.IP, mdata.Port), nil
+}
 
 func NewUdpConn(conn netproxy.PacketConn, proxyAddress string, metadata protocol.Metadata, masterKey []byte, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
 	conf := ciphers.AeadCiphersConf[metadata.Cipher]
@@ -172,6 +172,13 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 	metadata.Hostname = mdata.Hostname
 	metadata.Port = mdata.Port
 	metadata.Type = mdata.Type
+	metadata.IP = mdata.IP
+
+	if metadata.Type == protocol.MetadataTypeDomain && len(metadata.Hostname) > 255 {
+		// Reject rather than truncate: a silently shortened domain would send
+		// the datagram to the wrong host.
+		return 0, fmt.Errorf("domain name too long: %d", len(metadata.Hostname))
+	}
 
 	// Pre-calculate total size to allocate once
 	// Layout: [salt][metadata][payload][tag]
@@ -250,15 +257,19 @@ func writeMetadataInline(buf []byte, meta *Metadata) int {
 	buf[0] = MetadataTypeToByte(meta.Type)
 	switch meta.Type {
 	case protocol.MetadataTypeIPv4:
-		ip := net.ParseIP(meta.Hostname)
-		if ip != nil {
+		if meta.IP.Is4() {
+			ip4 := meta.IP.As4()
+			copy(buf[1:], ip4[:])
+		} else if ip := net.ParseIP(meta.Hostname); ip != nil {
 			copy(buf[1:], ip.To4()[:4])
 		}
 		binary.BigEndian.PutUint16(buf[5:], meta.Port)
 		return 7
 	case protocol.MetadataTypeIPv6:
-		ip := net.ParseIP(meta.Hostname)
-		if ip != nil {
+		if meta.IP.IsValid() && !meta.IP.Is4() {
+			ip16 := meta.IP.As16()
+			copy(buf[1:], ip16[:])
+		} else if ip := net.ParseIP(meta.Hostname); ip != nil {
 			copy(buf[1:], ip[:16])
 		}
 		binary.BigEndian.PutUint16(buf[17:], meta.Port)
@@ -287,10 +298,7 @@ func encryptUDPInPlace(key *Key, buf []byte, payloadLen int, reusedInfo []byte) 
 	subKey := getSubKey(key.CipherConf.KeyLen)
 	defer putSubKey(subKey)
 
-	kdf := hkdf.New(sha1.New, key.MasterKey, buf[:key.CipherConf.SaltLen], reusedInfo)
-	if _, err := io.ReadFull(kdf, subKey); err != nil {
-		return nil, err
-	}
+	deriveSubKey(subKey, key.MasterKey, buf[:key.CipherConf.SaltLen], reusedInfo)
 
 	ciph, err := key.CipherConf.NewCipher(subKey)
 	if err != nil {
@@ -332,26 +340,10 @@ func (c *UdpConn) ReadFrom(b []byte) (n int, addr netip.AddrPort, err error) {
 			return
 		}
 	}
-	// parse sAddr from metadata
-	sizeMetadata, err := BytesSizeForMetadata(b)
+	payload, addr, err := splitDecryptedUdp(b[:n])
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	mdata, err := NewMetadata(b)
-	if err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	switch mdata.Type {
-	case protocol.MetadataTypeIPv4, protocol.MetadataTypeIPv6:
-		ip, err := netip.ParseAddr(mdata.Hostname)
-		if err != nil {
-			return 0, netip.AddrPort{}, err
-		}
-		addr = netip.AddrPortFrom(ip, mdata.Port)
-	default:
-		return 0, netip.AddrPort{}, fmt.Errorf("bad metadata type: %v; should be ip", mdata.Type)
-	}
-	copy(b, b[sizeMetadata:])
-	n -= sizeMetadata
+	n = copy(b, payload)
 	return n, addr, nil
 }

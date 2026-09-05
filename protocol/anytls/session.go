@@ -7,13 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
 )
@@ -24,6 +25,10 @@ const (
 	sessionStateClosing
 	sessionStateClosed
 )
+
+type readBufferReleaser interface {
+	ReleaseReader()
+}
 
 type session struct {
 	conn     net.Conn
@@ -36,7 +41,6 @@ type session struct {
 	padding     *atomic.Pointer[paddingFactory]
 	sendPadding bool
 	pktCounter  atomic.Uint32
-	peerVersion byte
 
 	seq           uint64
 	sid           atomic.Uint32
@@ -48,6 +52,11 @@ type session struct {
 
 	closeStreamChan chan uint32
 	heartResponseCh chan struct{}
+
+	// writeBuf is a session-owned encode buffer used under connLock. Frames
+	// stay within maxFramePayloadSize, so this avoids pool.Get/Put per write
+	// without overflowing the pool cliff.
+	writeBuf []byte
 }
 
 func newSession(conn net.Conn, seq uint64) *session {
@@ -120,9 +129,13 @@ func (s *session) newPacketStream(addr, packetAddr string) (*packetStream, error
 	if err != nil {
 		return nil, err
 	}
+	// Lenient like the previous per-datagram parse: domain-shaped packet
+	// addresses yield a zero AddrPort instead of failing the stream.
+	addrPort, _ := netip.ParseAddrPort(packetAddr)
 	return &packetStream{
-		stream: stream,
-		addr:   packetAddr,
+		stream:   stream,
+		addr:     packetAddr,
+		addrPort: addrPort,
 	}, nil
 }
 
@@ -179,6 +192,11 @@ func (s *session) run() error {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("[Panic]", slog.String("stack", string(debug.Stack())))
+		}
+	}()
+	defer func() {
+		if releaser, ok := s.conn.(readBufferReleaser); ok {
+			releaser.ReleaseReader()
 		}
 	}()
 	defer func() { _ = s.Close() }()
@@ -274,11 +292,9 @@ func (s *session) run() error {
 					pool.Put(buffer)
 					return err
 				}
-				// check server's version
-				m := stringMapFromBytes(buffer)
-				if v, err := strconv.Atoi(m["v"]); err == nil {
-					s.peerVersion = byte(v)
-				}
+				// The settings payload (a version map) must be drained to
+				// keep the frame stream in sync, but the version itself is
+				// not consumed anywhere yet.
 				pool.Put(buffer)
 			}
 
@@ -311,13 +327,23 @@ func (s *session) Close() error {
 		s.activeStreams.Store(0)
 		s.streamLock.Unlock()
 		for _, stream := range streams {
-			_ = stream.closeLocal(false, net.ErrClosed)
+			stream.markClosed(net.ErrClosed)
 		}
 		_ = s.conn.Close()
+		s.connLock.Lock()
+		s.writeBuf = nil
+		s.connLock.Unlock()
 		s.state.Store(sessionStateClosed)
 		return nil
 	}
 	return nil
+}
+
+func (s *session) borrowWriteBuf(size int) []byte {
+	if cap(s.writeBuf) < size {
+		s.writeBuf = make([]byte, size)
+	}
+	return s.writeBuf[:size]
 }
 
 func (s *session) Closed() bool {
@@ -387,19 +413,9 @@ drained:
 	}
 }
 
-func (s *session) writeConn(b []byte) (n int, err error) {
-	return s.writeConnWithDeadline(b, time.Time{})
-}
-
-func (s *session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, err error) {
-	if s.closed.Load() {
-		return 0, net.ErrClosed
-	}
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-	if s.closed.Load() {
-		return 0, net.ErrClosed
-	}
+// writeConnLockedWithDeadline applies an optional write deadline then writes.
+// Caller must hold connLock.
+func (s *session) writeConnLockedWithDeadline(b []byte, deadline time.Time) (n int, err error) {
 	if !deadline.IsZero() {
 		if !deadline.After(time.Now()) {
 			return 0, os.ErrDeadlineExceeded
@@ -430,11 +446,11 @@ func (s *session) writeConnLocked(b []byte) (n int, err error) {
 				}
 				// logrus.Debugln(pkt, "write", l, "len", remainPayloadLen, "remain", remainPayloadLen-l)
 				if remainPayloadLen > l { // this packet is all payload
-					_, err = s.conn.Write(b[:l])
+					wn, err := iout.WriteFull(s.conn, b[:l])
+					n += wn
 					if err != nil {
-						return 0, err
+						return n, err
 					}
-					n += l
 					b = b[l:]
 				} else if remainPayloadLen > 0 { // this packet contains padding and the last part of payload
 					paddingLen := l - remainPayloadLen - headerOverHeadSize
@@ -445,15 +461,22 @@ func (s *session) writeConnLocked(b []byte) (n int, err error) {
 						combined := pool.Get(len(b) + headerOverHeadSize + paddingLen)
 						copy(combined, b)
 						fillWasteFrame(combined[len(b):], paddingLen)
-						_, err = s.conn.Write(combined)
+						wn, err := iout.WriteFull(s.conn, combined)
 						pool.Put(combined)
+						if wn > remainPayloadLen {
+							wn = remainPayloadLen
+						}
+						n += wn
+						if err != nil {
+							return n, err
+						}
 					} else {
-						_, err = s.conn.Write(b)
+						wn, err := iout.WriteFull(s.conn, b)
+						n += wn
+						if err != nil {
+							return n, err
+						}
 					}
-					if err != nil {
-						return 0, err
-					}
-					n += remainPayloadLen
 					b = nil
 				} else { // this packet is all padding
 					if l > maxFramePayloadSize {
@@ -461,10 +484,10 @@ func (s *session) writeConnLocked(b []byte) (n int, err error) {
 					}
 					padding := pool.Get(headerOverHeadSize + l)
 					fillWasteFrame(padding, l)
-					_, err = s.conn.Write(padding)
+					_, err = iout.WriteFull(s.conn, padding)
 					pool.Put(padding)
 					if err != nil {
-						return 0, err
+						return n, err
 					}
 					b = nil
 				}
@@ -472,16 +495,15 @@ func (s *session) writeConnLocked(b []byte) (n int, err error) {
 			// maybe still remain payload to write
 			if len(b) == 0 {
 				return
-			} else {
-				n2, err := s.conn.Write(b)
-				return n + n2, err
 			}
+			n2, err := iout.WriteFull(s.conn, b)
+			return n + n2, err
 		} else {
 			s.sendPadding = false
 		}
 	}
 
-	return s.conn.Write(b)
+	return iout.WriteFull(s.conn, b)
 }
 
 func fillWasteFrame(frame []byte, payloadLen int) {

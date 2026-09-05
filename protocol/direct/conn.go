@@ -26,10 +26,10 @@ type directPacketConn struct {
 	receiverGeneration uint64
 	cachedDialTgt      atomic.Value // stores netip.AddrPort
 	writeTgtCache      common.LastStringValue[netip.AddrPort]
-	cacheOnce          sync.Once
-	cacheMu            sync.Mutex // protects cacheErr
-	cacheErr           error
+	cacheMu            sync.Mutex // serializes lazy dial-target resolution in resolveTarget
 	resolver           *net.Resolver
+	batchOnce          sync.Once
+	batchWriter        packetBatchWriter
 }
 
 // Close unregisters the socket from the shared packet receiver before closing
@@ -107,6 +107,31 @@ var directBatchScratchPool = sync.Pool{
 
 const udpBatchScratchCapacity = 32
 
+type packetBatchWriter interface {
+	WriteBatch([]ipv6.Message, int) (int, error)
+}
+
+func (c *directPacketConn) getBatchWriter() packetBatchWriter {
+	c.batchOnce.Do(func() {
+		if ua, ok := c.UDPConn.LocalAddr().(*net.UDPAddr); ok && ua.IP.To4() != nil {
+			c.batchWriter = ipv4.NewPacketConn(c.UDPConn)
+			return
+		}
+		c.batchWriter = ipv6.NewPacketConn(c.UDPConn)
+	})
+	return c.batchWriter
+}
+
+func resetDirectBatchScratch(scratch *directBatchScratch, n int) {
+	clear(scratch.msgs[:n])
+	clear(scratch.iovs[:n])
+}
+
+func releaseDirectBatchScratch(scratch *directBatchScratch, n int) {
+	resetDirectBatchScratch(scratch, n)
+	directBatchScratchPool.Put(scratch)
+}
+
 // WriteBatch implements netproxy.PacketBatchWriter: several datagrams in one
 // sendmmsg syscall. On a connected (non-FullCone) socket every datagram goes
 // to the connected peer (Addr left nil); on a FullCone socket each item
@@ -120,7 +145,7 @@ func (c *directPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 		return c.writeBatchAlloc(items)
 	}
 	scratch := directBatchScratchPool.Get().(*directBatchScratch)
-	defer directBatchScratchPool.Put(scratch)
+	defer releaseDirectBatchScratch(scratch, len(items))
 	msgs := scratch.msgs[:len(items)]
 	iovs := scratch.iovs[:len(items)]
 	for i, it := range items {
@@ -128,7 +153,8 @@ func (c *directPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 		if c.FullCone {
 			target, err := c.writeTargetAddrPort(it.Addr)
 			if err != nil {
-				return i, err
+				// Nothing has been handed to sendmmsg yet, so n=0.
+				return 0, err
 			}
 			addr = net.UDPAddrFromAddrPort(target)
 		}
@@ -136,11 +162,7 @@ func (c *directPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 		// Sub-slicing the pooled iovs array avoids the escaping literal.
 		msgs[i] = ipv6.Message{Buffers: iovs[i : i+1], Addr: addr}
 	}
-	la := c.UDPConn.LocalAddr()
-	if ua, ok := la.(*net.UDPAddr); ok && ua.IP.To4() != nil {
-		return ipv4.NewPacketConn(c.UDPConn).WriteBatch(msgs, 0)
-	}
-	return ipv6.NewPacketConn(c.UDPConn).WriteBatch(msgs, 0)
+	return c.getBatchWriter().WriteBatch(msgs, 0)
 }
 
 func (c *directPacketConn) writeBatchAlloc(items []netproxy.BatchItem) (int, error) {
@@ -150,38 +172,35 @@ func (c *directPacketConn) writeBatchAlloc(items []netproxy.BatchItem) (int, err
 		if c.FullCone {
 			target, err := c.writeTargetAddrPort(it.Addr)
 			if err != nil {
-				return i, err
+				// Nothing has been handed to sendmmsg yet, so n=0.
+				return 0, err
 			}
 			addr = net.UDPAddrFromAddrPort(target)
 		}
 		msgs[i] = ipv6.Message{Buffers: [][]byte{it.Data}, Addr: addr}
 	}
-	la := c.UDPConn.LocalAddr()
-	if ua, ok := la.(*net.UDPAddr); ok && ua.IP.To4() != nil {
-		return ipv4.NewPacketConn(c.UDPConn).WriteBatch(msgs, 0)
-	}
-	return ipv6.NewPacketConn(c.UDPConn).WriteBatch(msgs, 0)
+	return c.getBatchWriter().WriteBatch(msgs, 0)
 }
 
 func (c *directPacketConn) resolveTarget() error {
-	c.cacheOnce.Do(func() {
-		ua, err := resolveUDPAddr(c.resolver, c.dialTgt)
-		c.cacheMu.Lock()
-		if err != nil {
-			c.cacheErr = err
-			c.cacheMu.Unlock()
-			return
-		}
-		// Store the value directly, not a pointer to a stack variable.
-		// atomic.Value stores the value on heap, ensuring memory safety.
-		ap := ua.AddrPort()
-		c.cachedDialTgt.Store(ap)
-		c.cacheMu.Unlock()
-	})
+	// Retryable by design: a failure must not be memoized for the lifetime
+	// of the conn (fullcone UDP relays live for hours — a transient resolver
+	// outage at first write would otherwise fail every later write).
 	c.cacheMu.Lock()
-	err := c.cacheErr
-	c.cacheMu.Unlock()
-	return err
+	defer c.cacheMu.Unlock()
+	if c.cachedDialTgt.Load() != nil {
+		return nil
+	}
+	ua, err := resolveUDPAddr(c.resolver, c.dialTgt)
+	if err != nil {
+		return err
+	}
+	// Store the value directly, not a pointer to a stack variable.
+	// atomic.Value stores the value on heap, ensuring memory safety.
+	resolved := ua.AddrPort()
+	ap := netip.AddrPortFrom(resolved.Addr().Unmap(), resolved.Port())
+	c.cachedDialTgt.Store(ap)
+	return nil
 }
 
 func (c *directPacketConn) writeTargetAddrPort(addr string) (netip.AddrPort, error) {
@@ -200,7 +219,8 @@ func (c *directPacketConn) writeTargetAddrPort(addr string) (netip.AddrPort, err
 	if err != nil {
 		return netip.AddrPort{}, err
 	}
-	target := uAddr.AddrPort()
+	resolved := uAddr.AddrPort()
+	target := netip.AddrPortFrom(resolved.Addr().Unmap(), resolved.Port())
 	c.writeTgtCache.Store(addr, target)
 	return target, nil
 }
@@ -212,7 +232,7 @@ func (c *directPacketConn) Write(b []byte) (int, error) {
 
 	// Lazy target resolution with thread-safe initialization.
 	// Thread-safety guarantees:
-	// 1. sync.Once in resolveTarget() provides happens-before relationship
+	// 1. cacheMu in resolveTarget() provides happens-before relationship
 	// 2. atomic.Value.Load/Store provides atomic access to the cached value
 	// 3. The netip.AddrPort value is stored directly in atomic.Value (heap-allocated)
 	if c.cachedDialTgt.Load() == nil {

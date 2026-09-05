@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"sync"
+	"sync/atomic"
 	"syscall"
 
 	outbounderrors "github.com/daeuniverse/outbound/common/errors"
@@ -13,41 +13,72 @@ import (
 )
 
 var (
-	SymmetricDirect  netproxy.Dialer = &lazyDirectDialer{fullcone: false}
-	FullconeDirect   netproxy.Dialer = &lazyDirectDialer{fullcone: true}
-	directOnce       sync.Once
-	_symmetricDirect netproxy.Dialer
-	_fullconeDirect  netproxy.Dialer
+	// SymmetricDirect and FullconeDirect are process-wide lazy views of the
+	// latest published DirectDialers pair. They remain the compatibility
+	// entry points; generation-scoped callers should use NewDirectDialers
+	// instead of reading these globals.
+	SymmetricDirect netproxy.Dialer = &lazyDirectDialer{fullcone: false}
+	FullconeDirect  netproxy.Dialer = &lazyDirectDialer{fullcone: true}
+
+	// globalDirectDialers holds one immutable Symmetric+Fullcone snapshot.
+	// Readers load a single pointer so they never observe a mixed-generation pair.
+	globalDirectDialers atomic.Pointer[DirectDialers]
 )
 
-// lazyDirectDialer provides lazy initialization for direct dialers.
-// It ensures InitDirectDialers is called before any dial operation.
+// DirectDialers is an immutable Symmetric/Fullcone pair that shares the
+// process-wide packetReceiver registry and does not publish process globals.
+// kdae can keep one pair per generation without racing InitDirectDialers.
+type DirectDialers struct {
+	Symmetric netproxy.Dialer
+	Fullcone  netproxy.Dialer
+}
+
+// Dialers is the generation-scoped pair name used by callers that want a
+// snapshot rather than the process-wide lazy globals.
+type Dialers = DirectDialers
+
+// NewDirectDialers builds a generation-scoped pair. It does not modify the
+// exported globals; call InitDirectDialers to publish a pair process-wide.
+func NewDirectDialers(fallbackDNS string) DirectDialers {
+	return DirectDialers{
+		Symmetric: NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: false, FallbackDNS: fallbackDNS}),
+		Fullcone:  NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: true, FallbackDNS: fallbackDNS}),
+	}
+}
+
+func loadGlobalDirectDialers() *DirectDialers {
+	for {
+		if pair := globalDirectDialers.Load(); pair != nil {
+			return pair
+		}
+		lazy := NewDirectDialers("")
+		if globalDirectDialers.CompareAndSwap(nil, &lazy) {
+			return &lazy
+		}
+	}
+}
+
+// lazyDirectDialer provides lazy initialization for the exported globals.
+// It always reads from a single atomic snapshot.
 type lazyDirectDialer struct {
 	fullcone bool
 }
 
-func (d *lazyDirectDialer) ensureInit() {
-	directOnce.Do(func() {
-		_symmetricDirect = NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: false})
-		_fullconeDirect = NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: true})
-	})
-}
-
 func (d *lazyDirectDialer) getDialer() netproxy.Dialer {
-	d.ensureInit()
+	pair := loadGlobalDirectDialers()
 	if d.fullcone {
-		return _fullconeDirect
+		return pair.Fullcone
 	}
-	return _symmetricDirect
+	return pair.Symmetric
 }
 
-// InitDirectDialers initializes the global direct dialers with optional fallback DNS.
-// If not called, dialers will be lazily initialized without fallback DNS on first use.
+// InitDirectDialers publishes a new immutable global pair with optional
+// fallback DNS. Later calls replace the snapshot atomically so a restart or
+// config reload can publish a new fallback resolver. If never called, dialers
+// are lazily initialized without fallback DNS on first use.
 func InitDirectDialers(fallbackDNS string) {
-	directOnce.Do(func() {
-		_symmetricDirect = NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: false, FallbackDNS: fallbackDNS})
-		_fullconeDirect = NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: true, FallbackDNS: fallbackDNS})
-	})
+	pair := NewDirectDialers(fallbackDNS)
+	globalDirectDialers.Store(&pair)
 }
 
 func (d *lazyDirectDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
@@ -107,7 +138,10 @@ func (d *directDialer) tryRetry(err error, addr string, callback func()) {
 
 	// addr is domain
 	if err != nil {
-		if err == outbounderrors.ErrDNSTimeout {
+		// The resolver surfaces *net.DNSError/*net.OpError, never the bare
+		// sentinel; an identity comparison here would never fire and the
+		// fallback-DNS retry would silently rot away.
+		if outbounderrors.IsDNSTimeout(err) {
 			callback()
 		}
 	}

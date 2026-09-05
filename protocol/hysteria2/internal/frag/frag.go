@@ -1,6 +1,7 @@
 package frag
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 	"time"
@@ -104,7 +105,7 @@ type Defragger struct {
 type fragmentState struct {
 	fragCount uint8
 	sessionID uint32
-	addr      string
+	addr      []byte
 	frags     []*protocol.UDPMessage
 	count     int
 	size      int
@@ -196,8 +197,11 @@ func (d *Defragger) Feed(m *protocol.UDPMessage) *protocol.UDPMessage {
 		// A PacketID identifies one logical packet. Mixing its fragment
 		// count, session or address would make the assembled payload
 		// ambiguous, so reject the new fragment but preserve the valid state.
-		if state.fragCount != m.FragCount || state.sessionID != m.SessionID || state.addr != m.Addr {
+		if state.fragCount != m.FragCount || state.sessionID != m.SessionID || !bytes.Equal(state.addr, m.Addr) {
 			releaseMessage(m)
+			return nil
+		}
+		if state.frags[m.FragID] == m {
 			return nil
 		}
 		if state.frags[m.FragID] != nil {
@@ -231,10 +235,12 @@ func (d *Defragger) Feed(m *protocol.UDPMessage) *protocol.UDPMessage {
 	for _, frag := range state.frags {
 		off += copy(data[off:], frag.Data)
 	}
+	addr := bytes.Clone(m.Addr)
 	d.removeStateLocked(m.PacketID, state)
 	for _, frag := range state.frags {
 		releaseMessage(frag)
 	}
+	m.Addr = addr
 	m.Data = data
 	m.FragID = 0
 	m.FragCount = 1

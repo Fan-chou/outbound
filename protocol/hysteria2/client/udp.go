@@ -1,12 +1,14 @@
 package client
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
 	"net/netip"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
@@ -51,7 +53,7 @@ type udpConn struct {
 	SendBuf   []byte
 	SendFunc  func([]byte, *protocol.UDPMessage) error
 	CloseFunc func()
-	Closed    bool
+	closed    atomic.Bool
 
 	// transportDone is closed when the underlying QUIC transport connection
 	// is permanently closed.  Allows upstream consumers (e.g. dae UdpEndpoint)
@@ -62,12 +64,21 @@ type udpConn struct {
 	receiveMu sync.Mutex
 	// deliverMu serializes RegisterPacketReceiver's drain against feed's
 	// deliver/queue path so queued datagrams stay FIFO with live ones.
-	deliverMu         sync.Mutex
-	muTimer           sync.Mutex
-	timer             *time.Timer
-	target            string
-	defaultTargetAddr netip.AddrPort // validated at session creation; replies may differ
-	natIdentity       netip.AddrPort // dae original dest; authoritative when set
+	deliverMu sync.Mutex
+	muTimer   sync.Mutex
+	timer     *time.Timer
+	target    string
+	// targetBytes is target as bytes for the per-datagram default-target
+	// comparison (message addresses are byte slices since they stopped
+	// being materialized as strings on receive).
+	targetBytes []byte
+	// writeAddrBytes caches the []byte form of the last WriteTo target
+	// under writeMu, so the steady-state single-target send path does not
+	// convert the address string per datagram.
+	writeAddrStr      string
+	writeAddrBytes    []byte
+	defaultTargetAddr netip.AddrPort
+	natIdentity       netip.AddrPort
 	receiverMu        sync.Mutex
 	receiver          netproxy.PacketReceiveHandler
 }
@@ -101,9 +112,7 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 			// Closed
 			return 0, netip.AddrPort{}, io.EOF
 		}
-		u.receiveMu.Lock()
-		dfMsg := u.D.Feed(msg)
-		u.receiveMu.Unlock()
+		dfMsg := u.feedMessage(msg)
 		if dfMsg == nil {
 			// Incomplete message, wait for more
 			continue
@@ -117,22 +126,6 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 		releaseUDPMessage(dfMsg)
 		return n, from, nil
 	}
-}
-
-// addrForMessage returns the datagram's peer. WriteTo may send to other
-// targets (dae FullCone), and each reply carries the actual peer in
-// UDPMessage.Addr. An IP default is cached to keep the common path
-// allocation-free. A domain default (hy2 allows host:port on the wire)
-// uses the userspace-NAT identity passed at session creation so a server
-// echo of the original host:port can be returned without local DNS.
-func (u *udpConn) addrForMessage(addr string) (netip.AddrPort, error) {
-	if u.natIdentity.IsValid() {
-		return u.natIdentity, nil
-	}
-	if addr == u.target && u.defaultTargetAddr.IsValid() {
-		return u.defaultTargetAddr, nil
-	}
-	return netip.ParseAddrPort(addr)
 }
 
 // RegisterPacketReceiver lets dae consume packets from the session manager's
@@ -180,6 +173,35 @@ func (u *udpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 	}
 }
 
+func (u *udpConn) addrForMessage(addr []byte) (netip.AddrPort, error) {
+	if u.natIdentity.IsValid() {
+		return u.natIdentity, nil
+	}
+	if bytes.Equal(addr, u.targetBytes) && u.defaultTargetAddr.IsValid() {
+		return u.defaultTargetAddr, nil
+	}
+	return netip.ParseAddrPort(string(addr))
+}
+
+// addrBytesForWrite converts a WriteTo target to the []byte form the message
+// carries. Callers hold writeMu; the steady state repeatedly targets the
+// session's fixed destination, so the conversion is cached per target.
+func (u *udpConn) addrBytesForWrite(addr string) []byte {
+	if addr == u.writeAddrStr {
+		return u.writeAddrBytes
+	}
+	b := []byte(addr)
+	u.writeAddrStr = addr
+	u.writeAddrBytes = b
+	return b
+}
+
+func (u *udpConn) feedMessage(msg *protocol.UDPMessage) *protocol.UDPMessage {
+	u.receiveMu.Lock()
+	defer u.receiveMu.Unlock()
+	return u.D.Feed(msg)
+}
+
 func (u *udpConn) deliverMessage(msg *protocol.UDPMessage) bool {
 	u.receiverMu.Lock()
 	handler := u.receiver
@@ -187,9 +209,7 @@ func (u *udpConn) deliverMessage(msg *protocol.UDPMessage) bool {
 	if handler == nil {
 		return false
 	}
-	u.receiveMu.Lock()
-	msg = u.D.Feed(msg)
-	u.receiveMu.Unlock()
+	msg = u.feedMessage(msg)
 	if msg == nil {
 		return true
 	}
@@ -214,7 +234,7 @@ func (u *udpConn) queueIfNoReceiver(msg *protocol.UDPMessage) bool {
 	if u.receiver != nil {
 		return false
 	}
-	if u.Closed {
+	if u.closed.Load() {
 		releaseUDPMessage(msg)
 		return true
 	}
@@ -231,7 +251,7 @@ func (u *udpConn) queueIfNoReceiver(msg *protocol.UDPMessage) bool {
 func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	u.writeMu.Lock()
 	defer u.writeMu.Unlock()
-	if u.Closed || u.SendBuf == nil {
+	if u.closed.Load() || u.SendBuf == nil {
 		return 0, coreErrs.ClosedError{}
 	}
 
@@ -241,7 +261,7 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 		PacketID:  0,
 		FragID:    0,
 		FragCount: 1,
-		Addr:      addr,
+		Addr:      u.addrBytesForWrite(addr),
 		Data:      b,
 	}
 	// The session's fixed serialization buffer is smaller than the theoretical
@@ -524,12 +544,8 @@ func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netp
 	id := m.nextID
 	m.nextID++
 
-	// Hy2 UDP addresses are opaque host:port strings. A domain is valid on
-	// the wire (the server resolves it). Cache an AddrPort when the default
-	// target is already an IP so the no-hint path stays allocation-free.
-	// When dae supplies a NAT identity, every reply of this session uses it:
-	// the server-reported IP may be a resolve_dns result, while the client
-	// socket still expects the original destination (including FakeIP).
+	// Validate the default target at session creation. WriteTo may send to
+	// other targets, and each reply carries its actual peer in UDPMessage.Addr.
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		return nil, err
 	}
@@ -550,6 +566,9 @@ func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netp
 		writeMu:           sync.Mutex{},
 		muTimer:           sync.Mutex{},
 		target:            addr,
+		targetBytes:       []byte(addr),
+		writeAddrStr:      addr,
+		writeAddrBytes:    []byte(addr),
 		defaultTargetAddr: defaultTargetAddr,
 		natIdentity:       natIdentity,
 	}
@@ -572,13 +591,13 @@ func (m *udpSessionManager) close(conn *udpConn) {
 }
 
 func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
-	if conn == nil || conn.Closed {
+	if conn == nil || conn.closed.Load() {
 		return nil
 	}
-	// Closed and receiver swap share receiverMu with queueIfNoReceiver so a
-	// send cannot race close(ReceiveCh).
+	// Publish closure before clearing the receiver. queueIfNoReceiver observes
+	// both while holding receiverMu; WriteTo observes the atomic closed flag.
 	conn.receiverMu.Lock()
-	conn.Closed = true
+	conn.closed.Store(true)
 	conn.receiver = nil
 	conn.receiverMu.Unlock()
 	conn.stopDeadlineTimer()

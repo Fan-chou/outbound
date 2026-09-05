@@ -66,6 +66,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 					Uuid:                 id,
 					Password:             header.Password,
 					CongestionController: header.Feature1.(string),
+					CWND:                 common.CWNDFromFeature(header.Feature2),
 					Ctx:                  ctx,
 					Cancel:               cancel,
 					UnderlayAuth:         make(chan *UnderlayAuth, 64),
@@ -92,7 +93,10 @@ func (d *Dialer) dialFuncFactory(udpNetwork string, rAddr net.Addr) common.DialF
 			conn.(netproxy.PacketConn),
 			net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
 			rAddr)
-		transport = &quic.Transport{Conn: pc}
+		transport = &quic.Transport{
+			Conn:               pc,
+			DisableAddrParsing: true,
+		}
 		return transport, rAddr, nil
 	}
 }
@@ -135,7 +139,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 				if err != nil {
 					return nil, err
 				}
-				transport, _, err := d.dialFuncFactory(udpNetwork, d.proxyUDPAddr)(context.TODO(), d.nextDialer)
+				transport, _, err := d.dialFuncFactory(udpNetwork, d.proxyUDPAddr)(ctx, d.nextDialer)
 				if err != nil {
 					return nil, err
 				}
@@ -160,9 +164,9 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		if magicNetwork.Network == "tcp" {
 			time.AfterFunc(100*time.Millisecond, func() {
 				// avoid the situation where the server sends messages first
-				if _, err = conn.Write(nil); err != nil {
-					return
-				}
+				// Write to the underlay purely for its side effect (wake the
+				// server); probe errors are not reportable here anymore.
+				_, _ = conn.Write(nil)
 			})
 			return conn, nil
 		} else {

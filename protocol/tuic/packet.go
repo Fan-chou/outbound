@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/pool/bytes"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/tuic/common"
 	"github.com/olicesx/quic-go"
@@ -28,6 +30,11 @@ type Packets struct {
 	ch       chan *Packet
 	receiver *packetHandlerRegistration
 	closed   atomic.Bool
+
+	// deliverMu serializes direct receiver delivery (PushBack) against the
+	// receiver swap + queued-prefix drain in registerPacketHandler, so a
+	// packet pushed after the swap cannot overtake the drained prefix (FIFO).
+	deliverMu sync.Mutex
 }
 
 type packetHandlerRegistration struct {
@@ -42,22 +49,20 @@ func NewPackets() *Packets {
 }
 
 func (p *Packets) PushBack(packet *Packet) {
+	p.deliverMu.Lock()
+	defer p.deliverMu.Unlock()
 	p.mu.Lock()
 	if p.closed.Load() {
 		p.mu.Unlock()
-		// Queue torn down: return the pooled DATA so the buffer is not lost.
 		packet.releaseData()
 		return
 	}
 	if receiver := p.receiver; receiver != nil {
 		p.mu.Unlock()
 		if receiver.active.Load() {
-			// handler owns the packet on true; on false deliverPacket has
-			// already released DATA (or the packet was not pool-backed).
 			receiver.handler(packet)
 			return
 		}
-		// active=false (unregister race): handler never ran, release here.
 		packet.releaseData()
 		return
 	}
@@ -81,6 +86,12 @@ func (p *Packets) registerPacketHandler(handler func(*Packet) bool) (func(), boo
 	registration := &packetHandlerRegistration{handler: handler}
 	registration.active.Store(true)
 
+	// Hold deliverMu across the receiver swap and the drain so a concurrent
+	// PushBack that observes the new receiver cannot deliver its packet
+	// before the drained prefix (FIFO, same pattern as hysteria2).
+	p.deliverMu.Lock()
+	defer p.deliverMu.Unlock()
+
 	p.mu.Lock()
 	if p.closed.Load() || p.receiver != nil {
 		p.mu.Unlock()
@@ -91,7 +102,10 @@ func (p *Packets) registerPacketHandler(handler func(*Packet) bool) (func(), boo
 drainLoop:
 	for {
 		select {
-		case pkt := <-p.ch:
+		case pkt, ok := <-p.ch:
+			if !ok {
+				break drainLoop
+			}
 			queued = append(queued, pkt)
 		default:
 			break drainLoop
@@ -100,14 +114,18 @@ drainLoop:
 	p.mu.Unlock()
 
 	for _, packet := range queued {
-		if !registration.active.Load() || !handler(packet) {
+		if !registration.active.Load() {
+			packet.releaseData()
 			continue
 		}
+		handler(packet)
 	}
 
 	var unregisterOnce sync.Once
 	return func() {
 		unregisterOnce.Do(func() {
+			// Do not take deliverMu here: handlers run while PushBack holds it,
+			// and are allowed to unregister themselves synchronously.
 			registration.active.Store(false)
 			p.mu.Lock()
 			if p.receiver == registration {
@@ -127,6 +145,8 @@ func (p *Packets) PopFrontBlock() (packet *Packet, closed bool) {
 }
 
 func (p *Packets) Close() error {
+	// Do not take deliverMu: a synchronous receiver callback may close its
+	// association. p.mu still serializes channel close with PushBack sends.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed.Load() {
@@ -152,10 +172,12 @@ func (p *Packets) Close() error {
 type quicStreamPacketConn struct {
 	mu sync.Mutex
 
-	target            string
+	target string
+	// addr caches the serialized wire Address per destination so the send
+	// path stops re-parsing the cached metadata on every datagram.
+	addr              outboundcommon.LastStringValue[*Address]
 	natIdentity       netip.AddrPort
 	defaultTargetAddr netip.AddrPort
-	addr              outboundcommon.LastStringValue[protocol.Metadata]
 
 	connId          uint16
 	quicConn        quic.Connection
@@ -167,9 +189,21 @@ type quicStreamPacketConn struct {
 	deferQuicConnFn func(quicConn quic.Connection, err error)
 	closeDeferFn    func()
 
+	// writeMu serializes datagram assembly and send on this association's
+	// private scratch buffer (writeScratch), the same per-flow lock shape
+	// as hysteria2/juicity. The shared pool LIFO costs a global mutex round
+	// per datagram; the hot send path now bypasses it entirely.
+	writeMu      sync.Mutex
+	writeScratch *bytes.Buffer
+
 	closeOnce sync.Once
 	closeErr  error
 	closed    atomic.Bool
+
+	// deadlineExceeded records that the conn was torn down by its own
+	// deadline timer rather than an explicit Close, so ReadFrom can report a
+	// timeout instead of net.ErrClosed.
+	deadlineExceeded atomic.Bool
 
 	deFraggers sync.Map
 
@@ -200,10 +234,24 @@ func (b *deFraggerBucket) removeAt(index int) {
 	if index < 0 || index >= len(b.deFraggers) {
 		return
 	}
+	if d := b.deFraggers[index]; d != nil {
+		d.release()
+	}
 	last := len(b.deFraggers) - 1
 	b.deFraggers[index] = b.deFraggers[last]
 	b.deFraggers[last] = nil
 	b.deFraggers = b.deFraggers[:last]
+}
+
+func (b *deFraggerBucket) release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, d := range b.deFraggers {
+		if d != nil {
+			d.release()
+		}
+	}
+	b.deFraggers = nil
 }
 
 func (b *deFraggerBucket) pruneExpired(nowNano int64) {
@@ -214,7 +262,11 @@ func (b *deFraggerBucket) pruneExpired(nowNano int64) {
 	}
 	dst := b.deFraggers[:0]
 	for _, d := range b.deFraggers {
-		if d == nil || d.IsExpired(nowNano, deFraggerIdleTimeout) {
+		if d == nil {
+			continue
+		}
+		if d.IsExpired(nowNano, deFraggerIdleTimeout) {
+			d.release()
 			continue
 		}
 		dst = append(dst, d)
@@ -225,9 +277,39 @@ func (b *deFraggerBucket) pruneExpired(nowNano int64) {
 	b.deFraggers = dst
 }
 
-func (b *deFraggerBucket) feed(packet *Packet, p []byte, nowNano int64) (n int, addr netip.AddrPort, assembled bool) {
+func (b *deFraggerBucket) feed(packet *Packet, p []byte, nowNano int64) (n int, addr netip.AddrPort, assembled bool, assembledLen int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if packet == nil {
+		for i, d := range b.deFraggers {
+			if d == nil {
+				continue
+			}
+			if size, ready := d.assembledLen(); ready && len(p) >= size {
+				var trigger *Packet
+				for _, frag := range d.frags {
+					if frag != nil {
+						trigger = frag
+						break
+					}
+				}
+				n, addr, assembled = d.Feed(trigger, p, nowNano)
+				if assembled {
+					last := len(b.deFraggers) - 1
+					b.deFraggers[i] = b.deFraggers[last]
+					b.deFraggers[last] = nil
+					b.deFraggers = b.deFraggers[:last]
+				}
+				return n, addr, assembled, size
+			}
+		}
+		return 0, netip.AddrPort{}, false, 0
+	}
+	if packet.FRAG_TOTAL <= 1 || packet.FRAG_ID >= packet.FRAG_TOTAL {
+		packet.releaseData()
+		return 0, netip.AddrPort{}, false, 0
+	}
 
 	var candidates []int
 	for i, d := range b.deFraggers {
@@ -271,26 +353,40 @@ func (b *deFraggerBucket) feed(packet *Packet, p []byte, nowNano int64) (n int, 
 			for _, idx := range candidates {
 				if d := b.deFraggers[idx]; d != nil && d.hasFirstFrag {
 					if selectedIndex != -1 {
-						return 0, netip.AddrPort{}, false
+						packet.releaseData()
+						return 0, netip.AddrPort{}, false, 0
 					}
 					selectedIndex = idx
 				}
 			}
 			if selectedIndex == -1 {
-				return 0, netip.AddrPort{}, false
+				packet.releaseData()
+				return 0, netip.AddrPort{}, false, 0
 			}
 		}
 	}
 
 	d := b.deFraggers[selectedIndex]
 	if d == nil {
-		return 0, netip.AddrPort{}, false
+		packet.releaseData()
+		return 0, netip.AddrPort{}, false, 0
+	}
+	assembledLen, ready := d.assembledLen()
+	if ready && len(p) < assembledLen {
+		return 0, netip.AddrPort{}, false, assembledLen
 	}
 	n, addr, assembled = d.Feed(packet, p, nowNano)
 	if assembled {
-		b.removeAt(selectedIndex)
+		last := len(b.deFraggers) - 1
+		b.deFraggers[selectedIndex] = b.deFraggers[last]
+		b.deFraggers[last] = nil
+		b.deFraggers = b.deFraggers[:last]
+		return n, addr, true, assembledLen
 	}
-	return n, addr, assembled
+	if size, ready := d.assembledLen(); ready {
+		return 0, netip.AddrPort{}, false, size
+	}
+	return 0, netip.AddrPort{}, false, 0
 }
 
 func (q *quicStreamPacketConn) Close() error {
@@ -318,6 +414,11 @@ func (q *quicStreamPacketConn) close() (err error) {
 		_ = incomingPackets.Close()
 	}
 	q.clearDeFraggers()
+	// Release the serialization scratch so a closed association does not
+	// pin its peak frame size until GC.
+	q.writeMu.Lock()
+	q.writeScratch = nil
+	q.writeMu.Unlock()
 	if incomingPackets != nil && q.quicConn != nil {
 
 		buf := pool.GetBuffer()
@@ -345,7 +446,9 @@ func (q *quicStreamPacketConn) close() (err error) {
 
 func (q *quicStreamPacketConn) clearDeFraggers() {
 	q.deFraggers.Range(func(key, value any) bool {
-		q.deFraggers.Delete(key)
+		if q.deFraggers.CompareAndDelete(key, value) {
+			value.(*deFraggerBucket).release()
+		}
 		return true
 	})
 }
@@ -374,6 +477,16 @@ func (q *quicStreamPacketConn) maybeCleanupDeFraggers(nowNano int64) {
 func (q *quicStreamPacketConn) SetDeadline(t time.Time) error {
 	q.muTimer.Lock()
 	defer q.muTimer.Unlock()
+	if t.IsZero() {
+		// A zero time clears the deadline per the net.Conn contract;
+		// time.Until would yield a hugely negative duration and fire the
+		// close callback immediately.
+		if q.deadlineTimer != nil {
+			q.deadlineTimer.Stop()
+			q.deadlineTimer = nil
+		}
+		return nil
+	}
 	dur := time.Until(t)
 	if q.deadlineTimer != nil {
 		q.deadlineTimer.Reset(dur)
@@ -381,6 +494,7 @@ func (q *quicStreamPacketConn) SetDeadline(t time.Time) error {
 		q.deadlineTimer = time.AfterFunc(dur, func() {
 			q.muTimer.Lock()
 			defer q.muTimer.Unlock()
+			q.deadlineExceeded.Store(true)
 			_ = q.Close()
 			q.deadlineTimer = nil
 		})
@@ -427,16 +541,27 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 	q.mu.Unlock()
 
 	if incomingPackets == nil {
+		if q.deadlineExceeded.Load() {
+			return 0, netip.AddrPort{}, os.ErrDeadlineExceeded
+		}
 		return 0, netip.AddrPort{}, net.ErrClosed
 	}
 
 	for {
 		packet, closed := incomingPackets.PopFrontBlock()
 		if closed {
-			err = net.ErrClosed
+			if q.deadlineExceeded.Load() {
+				err = os.ErrDeadlineExceeded
+			} else {
+				err = net.ErrClosed
+			}
 			return
 		}
 		if packet.FRAG_TOTAL <= 1 {
+			if packet.ADDR == nil {
+				packet.releaseData()
+				continue
+			}
 			n := copy(p, packet.DATA)
 			addr := q.addrPortFrom(packet.ADDR)
 			packet.releaseData()
@@ -444,14 +569,31 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 		}
 		nowNano := time.Now().UnixNano()
 		q.maybeCleanupDeFraggers(nowNano)
-		bucketAny, _ := q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+		bucketAny, loaded := q.deFraggers.Load(packet.PKT_ID)
+		if !loaded {
+			// First fragment of this packet id: allocate the bucket only now.
+			// Hitting LoadOrStore on every fragment would allocate a bucket
+			// per datagram and throw it away on an existing key.
+			bucketAny, _ = q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+		}
 		bucket := bucketAny.(*deFraggerBucket)
-		var assembled bool
-		if n, addr, assembled = bucket.feed(packet, p, nowNano); assembled {
+		if n, addr, assembled, assembledLen := bucket.feed(packet, p, nowNano); assembled {
 			if bucket.len() == 0 {
 				q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
 			}
 			return n, q.addrPortFromAssembled(addr), nil
+		} else if assembledLen > len(p) {
+			buffer := pool.GetFullCap(assembledLen)
+			n, addr, assembled, _ := bucket.feed(nil, buffer, nowNano)
+			if assembled {
+				copyN := copy(p, buffer[:n])
+				buffer.Put()
+				if bucket.len() == 0 {
+					q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
+				}
+				return copyN, q.addrPortFromAssembled(addr), nil
+			}
+			buffer.Put()
 		}
 	}
 }
@@ -478,7 +620,13 @@ func (q *quicStreamPacketConn) RegisterPacketReceiver(handler netproxy.PacketRec
 }
 
 func (q *quicStreamPacketConn) deliverPacket(handler netproxy.PacketReceiveHandler, packet *Packet) bool {
-	if packet == nil || q.closed.Load() {
+	if packet == nil {
+		return false
+	}
+	if q.closed.Load() {
+		// Callers rely on "a false return means deliverPacket already
+		// released DATA"; honor that contract on this early exit too.
+		packet.releaseData()
 		return false
 	}
 	if packet.FRAG_TOTAL <= 1 {
@@ -501,15 +649,27 @@ func (q *quicStreamPacketConn) deliverPacket(handler netproxy.PacketReceiveHandl
 
 	nowNano := time.Now().UnixNano()
 	q.maybeCleanupDeFraggers(nowNano)
-	bucketAny, _ := q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+	bucketAny, loaded := q.deFraggers.Load(packet.PKT_ID)
+	if !loaded {
+		bucketAny, _ = q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+	}
 	bucket := bucketAny.(*deFraggerBucket)
-	buffer := pool.GetFullCap(1 << 16)
-	n, addr, assembled := bucket.feed(packet, buffer, nowNano)
+	_, _, assembled, assembledLen := bucket.feed(packet, nil, nowNano)
+	if !assembled && assembledLen == 0 {
+		return true
+	}
+	buffer := pool.GetFullCap(assembledLen)
+	n, addr, assembled, _ := bucket.feed(nil, buffer, nowNano)
 	if !assembled {
 		buffer.Put()
 		return true
 	}
-	q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
+	if bucket.len() == 0 {
+		// Mirror ReadFrom: only retire the bucket once every in-flight
+		// defragger for this recycled 16-bit PKT_ID has completed. Deleting
+		// while other candidates remain strands their received fragments.
+		q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
+	}
 	received := netproxy.NewReceivedPacket(buffer[:n], q.addrPortFromAssembled(addr), nil, buffer.Put)
 	if handler(received) {
 		return true
@@ -530,13 +690,21 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 			q.deferQuicConnFn(q.quicConn, err)
 		}()
 	}
-	buf := pool.GetBuffer()
-	defer pool.PutBuffer(buf)
-	mdata, err := q.metadataForAddr(addr)
+	q.writeMu.Lock()
+	defer q.writeMu.Unlock()
+	// Conn-private serialization scratch: grown to this association's peak
+	// frame once, then reused without touching the shared pool. Nil-ed on
+	// Close so a closed association does not pin its peak size.
+	buf := q.writeScratch
+	if buf == nil {
+		buf = bytes.NewBuffer(nil)
+		q.writeScratch = buf
+	}
+	buf.Reset()
+	address, err := q.addressForAddr(addr)
 	if err != nil {
 		return 0, err
 	}
-	address := NewAddress(&mdata)
 	pktId := uint16(fastrand.Uint32())
 	packet := NewPacket(q.connId, pktId, 1, 0, uint16(len(p)), address, p, Ver5)
 	switch q.udpRelayMode {
@@ -556,22 +724,19 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 			return
 		}
 	default: // native
-		if len(p) > q.maxUdpRelayPacketSize {
-			err = fragWriteNative(q.quicConn, packet, buf, q.maxUdpRelayPacketSize)
-			if err != nil {
-				return
-			}
-		} else {
-			err = packet.WriteTo(buf)
-			if err != nil {
-				return
-			}
-			data := buf.Bytes()
-			err = q.quicConn.SendDatagram(data)
+		err = packet.WriteTo(buf)
+		if err != nil {
+			return
 		}
+		err = q.quicConn.SendDatagram(buf.Bytes())
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) {
-			err = fragWriteNative(q.quicConn, packet, buf, int(tooLarge.MaxDataLen)-PacketOverHead)
+			firstHeaderLen := packet.BytesLen() - len(packet.DATA)
+			fragSize := int(tooLarge.MaxDataLen) - firstHeaderLen
+			if q.maxUdpRelayPacketSize > 0 && fragSize > q.maxUdpRelayPacketSize {
+				fragSize = q.maxUdpRelayPacketSize
+			}
+			err = fragWriteNative(q.quicConn, packet, buf, fragSize)
 		}
 		if err != nil {
 			return
@@ -582,16 +747,17 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 	return
 }
 
-func (q *quicStreamPacketConn) metadataForAddr(addr string) (protocol.Metadata, error) {
+func (q *quicStreamPacketConn) addressForAddr(addr string) (*Address, error) {
 	if cached, ok := q.addr.Load(addr); ok {
 		return cached, nil
 	}
 	mdata, err := parseMetadata(addr)
 	if err != nil {
-		return protocol.Metadata{}, err
+		return nil, err
 	}
-	q.addr.Store(addr, mdata)
-	return mdata, nil
+	address := NewAddress(&mdata)
+	q.addr.Store(addr, address)
+	return address, nil
 }
 
 func (q *quicStreamPacketConn) LocalAddr() net.Addr {

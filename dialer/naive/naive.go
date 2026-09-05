@@ -55,7 +55,7 @@ func NewNaive(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link strin
 func parseNaiveURL(link string) (*Naive, error) {
 	u, err := url.Parse(link)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", dialer.InvalidParameterErr, err)
+		return nil, fmt.Errorf("%w: %w", dialer.InvalidParameterErr, err)
 	}
 
 	switch u.Scheme {
@@ -97,21 +97,9 @@ func parseNaiveURL(link string) (*Naive, error) {
 		Username:      username,
 		Password:      password,
 		Sni:           sni,
-		AllowInsecure: parseAllowInsecure(u.Query()),
+		AllowInsecure: dialer.AllowInsecureFromQuery(u.Query()),
 		Protocol:      u.Scheme,
 	}, nil
-}
-
-func parseAllowInsecure(query url.Values) bool {
-	for _, key := range []string{"allowInsecure", "allow_insecure", "allowinsecure", "skipVerify"} {
-		if value := query.Get(key); value != "" {
-			allowInsecure, _ := strconv.ParseBool(value)
-			if allowInsecure {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func (s *Naive) toDialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
@@ -203,6 +191,7 @@ func (d *naiveDialer) dialTCP(ctx context.Context, magicNetwork string, target s
 		return nil, err
 	}
 
+	closeCtx, closeCancel := context.WithCancel(context.Background())
 	return &naiveConn{
 		dialer:            d,
 		h2Conn:            h2Conn,
@@ -211,6 +200,8 @@ func (d *naiveDialer) dialTCP(ctx context.Context, magicNetwork string, target s
 		target:            target,
 		handshakeDeadline: netproxy.CaptureDeadline(ctx),
 		handshakeDone:     make(chan struct{}),
+		closeCtx:          closeCtx,
+		closeCancel:       closeCancel,
 	}, nil
 }
 
@@ -250,13 +241,7 @@ func (d *naiveDialer) newClientConn(ctx context.Context, magicNetwork string) (n
 		}
 	}
 
-	transport := &http2.Transport{
-		ConnPool:        d.pool,
-		IdleConnTimeout: 90 * time.Second,
-		ReadIdleTimeout: 30 * time.Second,
-		PingTimeout:     15 * time.Second,
-	}
-	h2Conn, err := transport.NewClientConn(&netproxy.FakeNetConn{Conn: rawConn})
+	h2Conn, err := d.pool.h2Transport.NewClientConn(&netproxy.FakeNetConn{Conn: rawConn})
 	if err != nil {
 		_ = rawConn.Close()
 		return nil, nil, fmt.Errorf("naive: H2 client: %w", err)
@@ -313,36 +298,71 @@ type naiveConn struct {
 	stream            *naiveH2Stream
 	closed            bool
 	closeOnce         sync.Once
+	closeCtx          context.Context
+	closeCancel       context.CancelFunc
+	requestCancel     context.CancelFunc
 }
 
 func (c *naiveConn) newHandshakeContext() (context.Context, context.CancelFunc) {
 	return netproxy.NewDialTimeoutContextWithCapturedDeadline(c.handshakeDeadline)
 }
 
-func (c *naiveConn) handshake(ctx context.Context, firstWrite []byte) (conn *naiveH2Stream, n int, err error) {
+func (c *naiveConn) handshake(handshakeCtx context.Context, firstWrite []byte) (conn *naiveH2Stream, n int, requestCancel context.CancelFunc, err error) {
+	if c.closeCtx == nil {
+		c.closeCtx, c.closeCancel = context.WithCancel(context.Background())
+	}
 	for attempt := 0; attempt < 2; attempt++ {
-		req, pw, reqErr := c.dialer.newConnectRequest(ctx, c.target)
+		// Bind CONNECT to the conn lifetime, not the handshake budget.
+		// Cancelling the handshake ctx after RoundTrip would RST_STREAM(CANCEL)
+		// a published stream (see protocol/http connectHttp2).
+		requestCtx, cancelRequest := context.WithCancel(c.closeCtx)
+		req, pw, reqErr := c.dialer.newConnectRequest(requestCtx, c.target)
 		if reqErr != nil {
-			return nil, 0, reqErr
+			cancelRequest()
+			return nil, 0, nil, reqErr
+		}
+
+		var stopWatch func() bool
+		if handshakeCtx != nil {
+			stopWatch = context.AfterFunc(handshakeCtx, cancelRequest)
 		}
 
 		resp, roundTripErr := c.h2Conn.RoundTrip(req)
+		handshakeCancelled := stopWatch != nil && !stopWatch()
 		if roundTripErr != nil {
+			cancelRequest()
 			_ = pw.CloseWithError(roundTripErr)
+			if handshakeCancelled {
+				if handshakeCtx.Err() != nil {
+					return nil, 0, nil, handshakeCtx.Err()
+				}
+				return nil, 0, nil, fmt.Errorf("naive CONNECT: %w", roundTripErr)
+			}
 			if attempt == 0 && shouldRetryNaiveRoundTrip(roundTripErr) {
-				if refreshErr := c.refreshClientConn(ctx); refreshErr == nil {
+				if refreshErr := c.refreshClientConn(handshakeCtx); refreshErr == nil {
 					continue
 				} else {
-					return nil, 0, fmt.Errorf("naive CONNECT retry failed after %v: %w", roundTripErr, refreshErr)
+					return nil, 0, nil, fmt.Errorf("naive CONNECT retry failed after %v: %w", roundTripErr, refreshErr)
 				}
 			}
-			return nil, 0, fmt.Errorf("naive CONNECT: %w", roundTripErr)
+			return nil, 0, nil, fmt.Errorf("naive CONNECT: %w", roundTripErr)
+		}
+
+		if handshakeCancelled {
+			cancelRequest()
+			_ = pw.Close()
+			_ = resp.Body.Close()
+			if handshakeCtx.Err() != nil {
+				return nil, 0, nil, handshakeCtx.Err()
+			}
+			return nil, 0, nil, fmt.Errorf("naive CONNECT: handshake cancelled")
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			cancelRequest()
 			_ = pw.Close()
 			_ = resp.Body.Close()
-			return nil, 0, fmt.Errorf("naive CONNECT failed: %v", resp.Status)
+			return nil, 0, nil, fmt.Errorf("naive CONNECT failed: %v", resp.Status)
 		}
 
 		paddingSupported := resp.Header.Get(paddingHeaderKey) != ""
@@ -356,15 +376,16 @@ func (c *naiveConn) handshake(ctx context.Context, firstWrite []byte) (conn *nai
 		if len(firstWrite) > 0 {
 			n, err = stream.Write(firstWrite)
 			if err != nil {
+				cancelRequest()
 				_ = stream.Close()
-				return nil, n, err
+				return nil, n, nil, err
 			}
 		}
 
-		return stream, n, nil
+		return stream, n, cancelRequest, nil
 	}
 
-	return nil, 0, fmt.Errorf("naive CONNECT: exhausted retries")
+	return nil, 0, nil, fmt.Errorf("naive CONNECT: exhausted retries")
 }
 
 func (c *naiveConn) refreshClientConn(ctx context.Context) error {
@@ -408,18 +429,26 @@ func (c *naiveConn) ensureHandshake(firstWrite []byte) (stream *naiveH2Stream, f
 		c.stateMu.Unlock()
 
 		handshakeCtx, cancel := c.newHandshakeContext()
-		stream, firstWriteN, err = c.handshake(handshakeCtx, firstWrite)
+		var requestCancel context.CancelFunc
+		stream, firstWriteN, requestCancel, err = c.handshake(handshakeCtx, firstWrite)
 		cancel()
 
 		c.stateMu.Lock()
-		if c.closed && stream != nil {
-			_ = stream.Close()
-			stream = nil
+		if c.closed {
+			if stream != nil {
+				_ = stream.Close()
+				stream = nil
+			}
+			if requestCancel != nil {
+				requestCancel()
+				requestCancel = nil
+			}
 			if err == nil {
 				err = net.ErrClosed
 			}
 		}
 		c.stream = stream
+		c.requestCancel = requestCancel
 		c.handshakeErr = err
 		close(done)
 		c.stateMu.Unlock()
@@ -469,10 +498,18 @@ func (c *naiveConn) Close() error {
 		c.stateMu.Lock()
 		c.closed = true
 		stream := c.stream
+		requestCancel := c.requestCancel
+		c.requestCancel = nil
 		c.stateMu.Unlock()
 
 		if stream != nil {
 			err = stream.Close()
+		}
+		if requestCancel != nil {
+			requestCancel()
+		}
+		if c.closeCancel != nil {
+			c.closeCancel()
 		}
 	})
 	return err
@@ -536,16 +573,28 @@ type naiveH2ConnList struct {
 }
 
 type naiveH2ConnPool struct {
-	mu         sync.Mutex
-	connsByNet map[string]*naiveH2ConnList
-	connToNet  map[*http2.ClientConn]string
+	mu          sync.Mutex
+	h2Transport *http2.Transport
+	connsByNet  map[string]*naiveH2ConnList
+	connToNet   map[*http2.ClientConn]string
 }
 
 func newNaiveH2ConnPool() *naiveH2ConnPool {
-	return &naiveH2ConnPool{
+	p := &naiveH2ConnPool{
 		connsByNet: make(map[string]*naiveH2ConnList),
 		connToNet:  make(map[*http2.ClientConn]string),
 	}
+	// One shared HTTP/2 transport for every pooled connection: a fresh
+	// transport per conn duplicated timers and bookkeeping for no benefit.
+	// ConnPool must loop back to this pool so death notifications still
+	// reach MarkDead.
+	p.h2Transport = &http2.Transport{
+		ConnPool:        p,
+		IdleConnTimeout: 90 * time.Second,
+		ReadIdleTimeout: 30 * time.Second,
+		PingTimeout:     15 * time.Second,
+	}
+	return p
 }
 
 func (p *naiveH2ConnPool) GetConn(ctx context.Context, d *naiveDialer, magicNetwork string) (netproxy.Conn, *http2.ClientConn, error) {
@@ -595,6 +644,10 @@ func (p *naiveH2ConnPool) registerConn(magicNetwork string, rawConn netproxy.Con
 }
 
 func (p *naiveH2ConnPool) GetClientConn(_ *http.Request, _ string) (*http2.ClientConn, error) {
+	// Always erroring is intentional: callers use pooled conns directly via
+	// GetConn and never ask the transport to pick one. Consequence: the
+	// transport's own IdleConnTimeout path never fires for these conns —
+	// idle raw conns are only reclaimed when the peer GoAways (MarkDead).
 	return nil, fmt.Errorf("naiveH2ConnPool: use cached client connections directly")
 }
 

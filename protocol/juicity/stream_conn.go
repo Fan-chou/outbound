@@ -17,9 +17,11 @@ type Conn struct {
 	quic.Stream
 	Metadata *trojanc.Metadata
 
-	writeMutex sync.Mutex
-	onceWrite  bool
-	onceRead   sync.Once
+	writeMutex     sync.Mutex
+	onceWrite      bool
+	packetWriteBuf []byte
+	headerOnce     sync.Once
+	headerErr      error
 
 	closeDeferFn  func()
 	transportDone <-chan struct{}
@@ -48,6 +50,7 @@ func (c *Conn) readReqHeader() (err error) {
 	c.Metadata.Network = trojanc.ParseNetwork(buf[0])
 	n := c.Metadata.Len()
 	if n < 2 {
+		_ = c.Stream.Close()
 		return fmt.Errorf("invalid juicity header")
 	}
 	if _, err = c.Metadata.Unpack(c.Stream); err != nil {
@@ -56,9 +59,25 @@ func (c *Conn) readReqHeader() (err error) {
 	return nil
 }
 
+const maxReusablePacketWriteBufferSize = 128 << 10
+
+func (c *Conn) borrowPacketWriteBuffer(size int) []byte {
+	if size <= maxReusablePacketWriteBufferSize {
+		if cap(c.packetWriteBuf) < size {
+			c.packetWriteBuf = make([]byte, size)
+		}
+		return c.packetWriteBuf[:size]
+	}
+	return make([]byte, size)
+}
+
 func (c *Conn) Write(b []byte) (n int, err error) {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
+	return c.writeLocked(b)
+}
+
+func (c *Conn) writeLocked(b []byte) (n int, err error) {
 	if !c.onceWrite {
 		if c.Metadata.IsClient {
 			header := c.reqHeader()
@@ -78,13 +97,14 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 }
 
 func (c *Conn) Read(b []byte) (n int, err error) {
-	c.onceRead.Do(func() {
-		if !c.Metadata.IsClient {
-			if err = c.readReqHeader(); err != nil {
-				return
-			}
+	if c.Metadata != nil && !c.Metadata.IsClient {
+		c.headerOnce.Do(func() {
+			c.headerErr = c.readReqHeader()
+		})
+		if c.headerErr != nil {
+			return 0, c.headerErr
 		}
-	})
+	}
 	return c.Stream.Read(b)
 }
 
@@ -119,6 +139,7 @@ func (c *Conn) close() error {
 	// This lock is eventually acquired despite Write also acquiring it, because we set a deadline to writes.
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
+	c.packetWriteBuf = nil
 
 	// We have to clean up the receiving stream ourselves since the Close in the bottom does not handle that.
 	c.CancelRead(0)

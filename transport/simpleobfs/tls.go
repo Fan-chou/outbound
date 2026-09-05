@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 )
@@ -29,15 +30,16 @@ type TLSObfs struct {
 }
 
 func (to *TLSObfs) read(b []byte, discardN int) (int, error) {
-	buf := make([]byte, discardN)
-	_, err := io.ReadFull(to.Conn, buf)
-	if err != nil {
+	var buf [3]byte
+	discard := buf[:discardN]
+	if _, err := io.ReadFull(to.Conn, discard); err != nil {
 		return 0, err
 	}
+	// A truncated size header must surface as an error: returning
+	// (0, nil) here made relay loops spin forever on success-with-no-data.
 	sizeBuf := make([]byte, 2)
-	_, err = io.ReadFull(to.Conn, sizeBuf)
-	if err != nil {
-		return 0, nil
+	if _, err := io.ReadFull(to.Conn, sizeBuf); err != nil {
+		return 0, err
 	}
 
 	length := int(binary.BigEndian.Uint16(sizeBuf))
@@ -99,17 +101,25 @@ func (to *TLSObfs) Write(b []byte) (int, error) {
 func (to *TLSObfs) write(b []byte) (int, error) {
 	if to.firstRequest {
 		helloMsg := makeClientHelloMsg(b, to.server)
-		_, err := to.Conn.Write(helloMsg)
+		if _, err := iout.WriteFull(to.Conn, helloMsg); err != nil {
+			return 0, err
+		}
 		to.firstRequest = false
-		return len(b), err
+		return len(b), nil
 	}
 
 	buf := &bytes.Buffer{}
 	buf.Write([]byte{0x17, 0x03, 0x03})
 	_ = binary.Write(buf, binary.BigEndian, uint16(len(b)))
 	buf.Write(b)
-	_, err := to.Conn.Write(buf.Bytes())
-	return len(b), err
+	if _, err := iout.WriteFull(to.Conn, buf.Bytes()); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (to *TLSObfs) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(to.Conn)
 }
 
 func NewTLSObfs(conn netproxy.Conn, server string) netproxy.Conn {

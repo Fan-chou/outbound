@@ -279,8 +279,8 @@ func TestPktConnWriteBatchFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBatch fallback: %v", err)
 	}
-	if n != 6 {
-		t.Fatalf("unexpected n: got %d want 6 (3+3 payload bytes)", n)
+	if n != 2 {
+		t.Fatalf("unexpected n: got %d want 2 datagrams", n)
 	}
 	recorder.inner.mu.Lock()
 	writes := recorder.inner.writes
@@ -297,5 +297,77 @@ func TestPktConnWriteBatchFallback(t *testing.T) {
 		if payload != string(items[i].Data) {
 			t.Fatalf("write #%d: payload mismatch: got %q want %q", i, payload, items[i].Data)
 		}
+	}
+}
+
+// TestPktConnWriteBatchInvalidAddrReturnsZeroAndReleasesBuffers is the M2
+// regression: a mid-batch parse failure must report n=0 (nothing left the
+// socket) and Put every already-allocated encapsulation buffer.
+func TestPktConnWriteBatchInvalidAddrReturnsZeroAndReleasesBuffers(t *testing.T) {
+	recorder := &recordingPacketConn{}
+	ctrlConn := newScriptedCtrlConn()
+	pc := NewPktConn(recorder, "127.0.0.1:1080", "1.1.1.1:53", ctrlConn)
+
+	items := []netproxy.BatchItem{
+		{Data: []byte("hello"), Addr: "10.0.0.1:53"},
+		{Data: []byte("world"), Addr: "not-an-address"},
+	}
+	n, err := pc.WriteBatch(items)
+	if err == nil {
+		t.Fatal("expected invalid-addr error")
+	}
+	if n != 0 {
+		t.Fatalf("n = %d, want 0 (nothing left the socket)", n)
+	}
+	recorder.mu.Lock()
+	writes := recorder.writes
+	recorder.mu.Unlock()
+	if len(writes) != 0 {
+		t.Fatalf("underlying WriteBatch ran with %d writes, want 0", len(writes))
+	}
+}
+
+// scriptedReplyPacketConn feeds one canned SOCKS UDP reply frame to the
+// first ReadFrom call, letting tests exercise the polling decode path.
+type scriptedReplyPacketConn struct {
+	recordingPacketConn
+	frame []byte
+	used  bool
+}
+
+func (c *scriptedReplyPacketConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
+	if c.used {
+		return 0, netip.AddrPort{}, io.EOF
+	}
+	c.used = true
+	n := copy(p, c.frame)
+	from := netip.MustParseAddrPort("203.0.113.9:1080")
+	return n, from, nil
+}
+
+// TestPktConnReadFromDecodesFramedReply locks the polling UDP reply decode:
+// the datagram is handed to the splitter whole (RSV+FRAG+ATYP+addr+payload)
+// and only the payload after the address survives in b.
+func TestPktConnReadFromDecodesFramedReply(t *testing.T) {
+	frame := []byte{
+		0x00, 0x00, // RSV
+		0x00, // FRAG
+		0x01, // ATYP_IPV4
+		198, 51, 100, 7,
+		0x01, 0xBB, // port 443
+		'p', 'o', 'n', 'g',
+	}
+	pc := &PktConn{PacketConn: &scriptedReplyPacketConn{frame: frame}}
+
+	buf := make([]byte, 64)
+	n, from, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+	if string(buf[:n]) != "pong" {
+		t.Fatalf("payload = %q, want %q", buf[:n], "pong")
+	}
+	if from != (netip.AddrPortFrom(netip.MustParseAddr("198.51.100.7"), 443)) {
+		t.Fatalf("from = %v, want 198.51.100.7:443", from)
 	}
 }

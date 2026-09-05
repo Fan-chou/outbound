@@ -33,10 +33,11 @@ type stream struct {
 	readMutex  sync.Mutex
 	enqueueMu  sync.RWMutex
 
-	closed   atomic.Bool
-	closeCh  chan struct{}
-	closeMu  sync.Mutex
-	closeErr error
+	closed      atomic.Bool
+	writeClosed atomic.Bool
+	closeCh     chan struct{}
+	closeMu     sync.Mutex
+	closeErr    error
 
 	readDeadline    atomic.Int64
 	writeDeadline   atomic.Int64
@@ -83,7 +84,7 @@ func (c *stream) enqueue(chunk pool.PB) error {
 }
 
 func (c *stream) Write(b []byte) (n int, err error) {
-	if c.closed.Load() {
+	if c.closed.Load() || c.writeClosed.Load() {
 		return 0, net.ErrClosed
 	}
 	if len(b) == 0 {
@@ -91,7 +92,7 @@ func (c *stream) Write(b []byte) (n int, err error) {
 	}
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
-	if c.closed.Load() {
+	if c.closed.Load() || c.writeClosed.Load() {
 		return 0, net.ErrClosed
 	}
 
@@ -141,8 +142,16 @@ func (c *stream) nextChunkLocked() (pool.PB, error) {
 			return chunk, nil
 		default:
 		}
-		if err := c.closedError(); err != nil {
-			return nil, err
+		if c.closed.Load() {
+			// A close may race an enqueue admitted before the close signal.
+			c.enqueueMu.Lock()
+			c.enqueueMu.Unlock()
+			select {
+			case chunk := <-c.inbound:
+				return chunk, nil
+			default:
+				return nil, c.closedError()
+			}
 		}
 
 		deadline := unixNanoToTime(c.readDeadline.Load())
@@ -158,12 +167,7 @@ func (c *stream) nextChunkLocked() (pool.PB, error) {
 				return chunk, nil
 			case <-c.closeCh:
 				stopTimer(timer)
-				select {
-				case chunk := <-c.inbound:
-					return chunk, nil
-				default:
-				}
-				return nil, c.closedError()
+				continue
 			case <-c.deadlineChanged:
 				stopTimer(timer)
 				continue
@@ -176,7 +180,7 @@ func (c *stream) nextChunkLocked() (pool.PB, error) {
 		case chunk := <-c.inbound:
 			return chunk, nil
 		case <-c.closeCh:
-			return nil, c.closedError()
+			continue
 		case <-c.deadlineChanged:
 			continue
 		}
@@ -193,33 +197,58 @@ func stopTimer(timer *time.Timer) {
 }
 
 func (c *stream) remoteClose() error {
-	return c.closeLocal(false, io.EOF)
+	c.markClosed(io.EOF)
+	c.removeStream(c.id)
+	return nil
 }
 
 func (c *stream) Close() error {
 	return c.closeLocal(true, net.ErrClosed)
 }
 
-func (c *stream) closeLocal(sendFIN bool, err error) error {
-	c.closeMu.Lock()
-	if !c.closed.CompareAndSwap(false, true) {
-		c.closeMu.Unlock()
+func (c *stream) CloseWrite() error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	if !c.writeClosed.CompareAndSwap(false, true) {
 		return nil
+	}
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.session.closed.Load() {
+		return net.ErrClosed
+	}
+	frame := newFrame(cmdFIN, c.id)
+	_, err := writeFrame(c.session, frame)
+	return err
+}
+
+// markClosed stops new I/O but leaves received buffers owned by the reader.
+// Only local Close discards unread data; remote and session closes allow draining.
+func (c *stream) markClosed(err error) bool {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if !c.closed.CompareAndSwap(false, true) {
+		return false
 	}
 	c.closeErr = err
 	close(c.closeCh)
-	c.closeMu.Unlock()
+	return true
+}
 
-	// Closing closeCh releases blocked enqueues. The write lock then ensures
-	// every admitted enqueue finishes before the inbound queue is drained.
+func (c *stream) closeLocal(sendFIN bool, err error) error {
+	firstClose := c.markClosed(err)
+
+	// Closing closeCh releases blocked enqueues. Wait for every admitted
+	// enqueue before taking readMutex, which readers hold while draining.
 	c.enqueueMu.Lock()
+	c.enqueueMu.Unlock()
 	c.readMutex.Lock()
 	if c.readBufPB != nil {
 		pool.Put(c.readBufPB)
 		c.readBufPB = nil
 		c.readBuf = nil
 	}
-	c.readMutex.Unlock()
 
 drainLoop:
 	for {
@@ -230,14 +259,14 @@ drainLoop:
 			break drainLoop
 		}
 	}
-	c.enqueueMu.Unlock()
+	c.readMutex.Unlock()
 
 	// A locally generated FIN must follow every write that started before Close.
 	// Session and remote closes skip this lock so a blocked transport write cannot
 	// prevent the underlying connection from being closed.
-	if sendFIN {
+	if sendFIN && firstClose {
 		c.writeMutex.Lock()
-		if !c.session.closed.Load() {
+		if c.writeClosed.CompareAndSwap(false, true) && !c.session.closed.Load() {
 			frame := newFrame(cmdFIN, c.id)
 			_, _ = writeFrame(c.session, frame)
 		}
@@ -289,7 +318,11 @@ func (c *stream) SetWriteDeadline(t time.Time) error {
 type packetStream struct {
 	*stream
 
-	addr         string
+	addr string
+	// addrPort is addr parsed once at construction: the per-datagram read
+	// path used to re-run netip.ParseAddrPort on every ReadFrom for an
+	// address that never changes.
+	addrPort     netip.AddrPort
 	replyFrom    netip.AddrPort
 	udpWriteAddr atomic.Bool
 }
@@ -307,10 +340,8 @@ func (ps *packetStream) ReadFrom(p []byte) (int, netip.AddrPort, error) {
 	ps.readMutex.Lock()
 	defer ps.readMutex.Unlock()
 
-	addr, err := netip.ParseAddrPort(ps.addr)
-	if err != nil {
-		addr = ps.replyFrom
-	} else if ps.replyFrom.IsValid() {
+	addr := ps.addrPort
+	if ps.replyFrom.IsValid() {
 		addr = ps.replyFrom
 	}
 	var length uint16

@@ -50,7 +50,7 @@ type session struct {
 	closed        atomic.Bool
 	done          chan struct{}
 
-	closeStreamChan chan uint32
+	owner           *Dialer // immutable after publication
 	heartResponseCh chan struct{}
 }
 
@@ -67,7 +67,6 @@ func newSessionWithPadding(conn net.Conn, seq uint64, padding *atomic.Pointer[pa
 		padding:         padding,
 		seq:             seq,
 		done:            make(chan struct{}),
-		closeStreamChan: make(chan uint32, 2),
 		heartResponseCh: make(chan struct{}, 1),
 		sendPadding:     true,
 	}
@@ -158,16 +157,10 @@ func (s *session) removeStream(sid uint32) {
 	s.state.Store(sessionStateIdle)
 	s.idleAt.Store(time.Now().UnixNano())
 
-	select {
-	case <-s.done:
-		return
-	default:
+	if s.owner != nil && s.owner.sessionIdle(s) {
+		_ = s.Close()
 	}
-	select {
-	case s.closeStreamChan <- sid:
-	case <-s.done:
-	default:
-	}
+
 }
 
 func (s *session) addStream(stream *stream) error {
@@ -326,6 +319,9 @@ func (s *session) Close() error {
 		}
 		_ = s.conn.Close()
 		s.state.Store(sessionStateClosed)
+		if s.owner != nil {
+			s.owner.sessionClosed(s)
+		}
 		return nil
 	}
 	return nil

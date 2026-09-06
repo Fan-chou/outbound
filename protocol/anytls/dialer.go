@@ -72,41 +72,35 @@ func (d *Dialer) UnwrapDialer() netproxy.Dialer {
 	return d.nextDialer
 }
 
-func (d *Dialer) watchSession(s *session) {
-	for {
-		select {
-		case <-s.Done():
-			d.idleSessionLock.Lock()
-			if current, ok := d.idleSessions[s.seq]; ok && current == s {
-				delete(d.idleSessions, s.seq)
-			}
-			if current, ok := d.sessions[s.seq]; ok && current == s {
-				delete(d.sessions, s.seq)
-			}
-			d.idleSessionLock.Unlock()
-			return
-		case <-s.closeStreamChan:
-			if !s.isReusableIdle() {
-				continue
-			}
-			var closeSession bool
-			d.idleSessionLock.Lock()
-			if d.closed {
-				closeSession = true
-			} else {
-				if _, ok := d.idleSessions[s.seq]; !ok {
-					if len(d.idleSessions) >= maxIdleSessions {
-						closeSession = true
-					} else {
-						d.idleSessions[s.seq] = s
-					}
-				}
-			}
-			d.idleSessionLock.Unlock()
-			if closeSession {
-				_ = s.Close()
-			}
-		}
+// sessionIdle returns whether the caller should close the idle session.
+// Callers hold no session locks; connection teardown happens after this returns.
+func (d *Dialer) sessionIdle(s *session) bool {
+	d.idleSessionLock.Lock()
+	defer d.idleSessionLock.Unlock()
+	if d.closed {
+		return true
+	}
+	if d.sessions[s.seq] != s || !s.isReusableIdle() {
+		return false
+	}
+	if d.idleSessions[s.seq] == s {
+		return false
+	}
+	if len(d.idleSessions) >= maxIdleSessions {
+		return true
+	}
+	d.idleSessions[s.seq] = s
+	return false
+}
+
+func (d *Dialer) sessionClosed(s *session) {
+	d.idleSessionLock.Lock()
+	defer d.idleSessionLock.Unlock()
+	if d.idleSessions[s.seq] == s {
+		delete(d.idleSessions, s.seq)
+	}
+	if d.sessions[s.seq] == s {
+		delete(d.sessions, s.seq)
 	}
 }
 
@@ -219,6 +213,7 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 	bufferedConn := bufferred_conn.NewBufferedConnSize(tlsConn, sessionReadBufferSize)
 	seq := d.sessionCounter.Add(1)
 	s := newSessionWithPadding(bufferedConn, seq, &d.padding)
+	s.owner = d
 	d.idleSessionLock.Lock()
 	if d.closed {
 		d.idleSessionLock.Unlock()
@@ -228,7 +223,6 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 	}
 	d.sessions[seq] = s
 	d.idleSessionLock.Unlock()
-	go d.watchSession(s)
 
 	go func() { _ = s.run() }()
 

@@ -109,7 +109,7 @@ func TestSessionCloseClosesActiveStreamsWithoutDeadlock(t *testing.T) {
 	}
 }
 
-func TestDialerWatchSessionStopsAfterSessionClose(t *testing.T) {
+func TestDialerSessionCallbacksRetireSession(t *testing.T) {
 	d := &Dialer{
 		idleSessions: make(map[uint64]*session),
 		sessions:     make(map[uint64]*session),
@@ -121,11 +121,7 @@ func TestDialerWatchSessionStopsAfterSessionClose(t *testing.T) {
 	}
 	d.sessions[s.seq] = s
 
-	done := make(chan struct{})
-	go func() {
-		d.watchSession(s)
-		close(done)
-	}()
+	s.owner = d
 
 	if err := stream.Close(); err != nil {
 		t.Fatalf("stream Close() error = %v", err)
@@ -147,12 +143,6 @@ func TestDialerWatchSessionStopsAfterSessionClose(t *testing.T) {
 
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
-	}
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("watchSession did not exit after session close")
 	}
 
 	d.idleSessionLock.Lock()
@@ -422,11 +412,7 @@ func TestIdleSessionReuseRequiresIdleState(t *testing.T) {
 		t.Fatalf("addStream() error = %v", err)
 	}
 	d.sessions[s.seq] = s
-	done := make(chan struct{})
-	go func() {
-		d.watchSession(s)
-		close(done)
-	}()
+	s.owner = d
 
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -456,11 +442,7 @@ func TestIdleSessionReuseRequiresIdleState(t *testing.T) {
 		t.Fatalf("session state = %d, want active", state)
 	}
 	_ = s.Close()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("watchSession did not exit")
-	}
+
 }
 
 func appendLengthPrefixed(dst, payload []byte) []byte {

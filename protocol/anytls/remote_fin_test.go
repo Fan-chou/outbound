@@ -44,7 +44,7 @@ func TestReviewAnyTLSRemoteFINPreservesQueuedData(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-s.closeStreamChan:
+	case <-st.closeCh:
 	case <-time.After(time.Second):
 		t.Fatal("FIN was not processed")
 	}

@@ -206,20 +206,23 @@ func (c *stream) Close() error {
 	return c.closeLocal(true, net.ErrClosed)
 }
 
+// CloseWrite sends AnyTLS's full-stream FIN, not a TCP half-close.
+// The peer need not reply; retire locally while preserving admitted data.
 func (c *stream) CloseWrite() error {
-	if c.closed.Load() {
-		return net.ErrClosed
-	}
-	if !c.writeClosed.CompareAndSwap(false, true) {
+	c.writeMutex.Lock()
+	if c.closed.Load() || !c.writeClosed.CompareAndSwap(false, true) {
+		c.writeMutex.Unlock()
 		return nil
 	}
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	if c.session.closed.Load() {
-		return net.ErrClosed
+	_, err := writeFrame(c.session, newFrame(cmdFIN, c.id))
+	terminal := error(io.EOF)
+	if err != nil {
+		terminal = err
 	}
-	frame := newFrame(cmdFIN, c.id)
-	_, err := writeFrame(c.session, frame)
+	c.markClosed(terminal)
+	c.writeMutex.Unlock()
+	// Notify lifecycle owners outside the write lock.
+	c.removeStream(c.id)
 	return err
 }
 

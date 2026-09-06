@@ -1,3 +1,7 @@
+//go:build !race
+
+// Allocation budgets run without race instrumentation: race-enabled sync.Pool
+// deliberately drops entries, so it cannot measure production pool reuse.
 package anytls
 
 import (
@@ -11,8 +15,7 @@ import (
 // fixed by capping maxFramePayloadSize within pool range. The cliff's signature
 // is a large B/op (TotalAlloc per write), not the alloc count: pre-fix emitted
 // ~73832 B/op because the encoded frame overflowed the pool and forced a heap
-// allocation per write; post-fix is ~48 B/op. TotalAlloc is deterministic and
-// machine-independent, so this assertion is not fragile like a ns/op threshold.
+// allocation per write; post-fix is ~48 B/op. The budget allows warmup and GC-related pool misses without using a timing threshold.
 func TestAnytlsWriteNoAllocCliff(t *testing.T) {
 	sess := newSession(bench.NewNetDiscardConn(), 0)
 	stream, err := sess.newStream("127.0.0.1:8080")

@@ -58,3 +58,24 @@ func TestLocalFINLeavesOtherStreamOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type failingFINConn struct{ recordingConn }
+
+func (c *failingFINConn) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestLocalFINWriteFailureRetiresTransport(t *testing.T) {
+	s := newSession(&failingFINConn{}, 1)
+	defer s.Close()
+	st := newStream(s, 1)
+	_ = s.addStream(st)
+	defer st.Close()
+	if err := st.CloseWrite(); err != io.ErrClosedPipe {
+		t.Fatalf("FIN error=%v", err)
+	}
+	if !s.Closed() || s.activeStreams.Load() != 0 {
+		t.Fatal("failed FIN left reusable transport")
+	}
+	if _, err := st.Read(make([]byte, 1)); err != io.ErrClosedPipe {
+		t.Fatalf("Read error=%v", err)
+	}
+}

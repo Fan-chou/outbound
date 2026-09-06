@@ -221,6 +221,10 @@ func (c *stream) CloseWrite() error {
 	}
 	c.markClosed(terminal)
 	c.writeMutex.Unlock()
+	// A failed FIN can leave partial framing on the transport; do not reuse it.
+	if err != nil {
+		_ = c.session.Close()
+	}
 	// Notify lifecycle owners outside the write lock.
 	c.removeStream(c.id)
 	return err

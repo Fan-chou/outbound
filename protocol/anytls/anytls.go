@@ -3,6 +3,7 @@ package anytls
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/daeuniverse/outbound/pool"
 	"math"
 	"net"
 	"time"
@@ -74,7 +75,8 @@ func writeFrameWithDeadline(session *session, frame frame, deadline time.Time) (
 		session.connLock.Unlock()
 		return 0, net.ErrClosed
 	}
-	buffer := session.borrowWriteBuf(size)
+	buffer := pool.Get(size)
+	defer pool.Put(buffer)
 	encodeFrame(buffer, frame)
 	if _, err = session.writeConnLockedWithDeadline(buffer, deadline); err != nil {
 		session.connLock.Unlock()
@@ -101,7 +103,8 @@ func writeFrames(session *session, frames ...frame) (int, error) {
 		session.connLock.Unlock()
 		return 0, net.ErrClosed
 	}
-	buffer := session.borrowWriteBuf(totalSize)
+	buffer := pool.Get(totalSize)
+	defer pool.Put(buffer)
 	offset := 0
 	for _, frame := range frames {
 		offset += encodeFrame(buffer[offset:], frame)

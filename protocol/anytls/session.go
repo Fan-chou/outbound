@@ -52,11 +52,6 @@ type session struct {
 
 	closeStreamChan chan uint32
 	heartResponseCh chan struct{}
-
-	// writeBuf is a session-owned encode buffer used under connLock. Frames
-	// stay within maxFramePayloadSize, so this avoids pool.Get/Put per write
-	// without overflowing the pool cliff.
-	writeBuf []byte
 }
 
 func newSession(conn net.Conn, seq uint64) *session {
@@ -330,20 +325,10 @@ func (s *session) Close() error {
 			stream.markClosed(net.ErrClosed)
 		}
 		_ = s.conn.Close()
-		s.connLock.Lock()
-		s.writeBuf = nil
-		s.connLock.Unlock()
 		s.state.Store(sessionStateClosed)
 		return nil
 	}
 	return nil
-}
-
-func (s *session) borrowWriteBuf(size int) []byte {
-	if cap(s.writeBuf) < size {
-		s.writeBuf = make([]byte, size)
-	}
-	return s.writeBuf[:size]
 }
 
 func (s *session) Closed() bool {

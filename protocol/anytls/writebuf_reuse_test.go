@@ -3,30 +3,7 @@ package anytls
 import (
 	"bytes"
 	"testing"
-
-	"github.com/daeuniverse/outbound/protocol/infra/bench"
 )
-
-func TestSessionWriteBufReleasedOnClose(t *testing.T) {
-	sess := newSession(bench.NewNetDiscardConn(), 0)
-	stream, err := sess.newStream("127.0.0.1:8080")
-	if err != nil {
-		t.Fatalf("newStream: %v", err)
-	}
-	payload := bytes.Repeat([]byte{0xab}, 1024)
-	if _, err := stream.Write(payload); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if cap(sess.writeBuf) == 0 {
-		t.Fatal("expected session writeBuf after stream write")
-	}
-	if err := sess.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if sess.writeBuf != nil {
-		t.Fatal("expected writeBuf to be released on Close")
-	}
-}
 
 func TestWriteFrameEncodingUnchanged(t *testing.T) {
 	rec := &recordingConn{}

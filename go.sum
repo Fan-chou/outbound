@@ -1,5 +1,7 @@
 github.com/Fan-chou/quic-go v0.0.0-20260831031827-fbf90cb0a47d h1:FOJ0LoSUMDDij+CYBRO3waCcgq5HTiXEreT2gFwkTxo=
 github.com/Fan-chou/quic-go v0.0.0-20260831031827-fbf90cb0a47d/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
+github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d h1:GQNKnrRvEYyzYS2TPxePF2VgeWfNubZou/7wRmj/4KA=
+github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/andybalholm/brotli v1.0.6 h1:Yf9fFpf49Zrxb9NlQaluyE92/+X7UVHlhMNJN2sxfOI=
 github.com/andybalholm/brotli v1.0.6/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
 github.com/awnumar/fastrand v0.0.0-20210315215012-30ee0990fa2d h1:NkqtWyrOjr0QK1FSCmXS6Whbwh100Qt74SaRn92PemU=

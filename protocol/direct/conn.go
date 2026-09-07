@@ -72,8 +72,10 @@ func (c *directPacketConn) WriteTo(b []byte, addr string) (int, error) {
 
 func (c *directPacketConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
 	if !c.FullCone {
-		n, err = c.Write(b)
-		return n, 0, err
+		// A connected UDP socket already has a peer; a nil destination keeps
+		// that binding while preserving UDP_SEGMENT and ECN control messages.
+		// Plain Write would send a GSO batch as one corrupt UDP datagram.
+		return c.UDPConn.WriteMsgUDP(b, oob, nil)
 	}
 
 	return c.UDPConn.WriteMsgUDP(b, oob, addr)

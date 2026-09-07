@@ -1,6 +1,7 @@
 package tuic
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"sync/atomic"
@@ -51,6 +52,10 @@ func fragmentPackets(packet *Packet, fragSize int) ([]*Packet, error) {
 }
 
 func fragWriteNative(quicConn quic.Connection, packet *Packet, buf *bytes.Buffer, fragSize int) (err error) {
+	return fragWriteNativeContext(context.Background(), quicConn, packet, buf, fragSize)
+}
+
+func fragWriteNativeContext(ctx context.Context, quicConn quic.Connection, packet *Packet, buf *bytes.Buffer, fragSize int) (err error) {
 	frags, err := fragmentPackets(packet, fragSize)
 	if err != nil {
 		return err
@@ -62,7 +67,7 @@ func fragWriteNative(quicConn quic.Connection, packet *Packet, buf *bytes.Buffer
 			return
 		}
 		data := buf.Bytes()
-		err = quicConn.SendDatagram(data)
+		err = quicConn.SendDatagramContext(ctx, data)
 		if err != nil {
 			return
 		}

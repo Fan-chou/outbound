@@ -553,10 +553,10 @@ func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 	}
 }
 
-func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
+func (io *udpIOImpl) SendMessage(ctx context.Context, buf []byte, msg *protocol.UDPMessage) error {
 	msgN := msg.Serialize(buf)
 	if msgN < 0 {
 		return &quic.DatagramTooLargeError{MaxDataLen: int64(len(buf))}
 	}
-	return io.Conn.SendDatagram(buf[:msgN])
+	return io.Conn.SendDatagramContext(ctx, buf[:msgN])
 }

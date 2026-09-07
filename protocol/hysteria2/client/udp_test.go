@@ -2,9 +2,11 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"errors"
-	"io"
+	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,8 +21,8 @@ import (
 
 type noopUDPTestIO struct{}
 
-func (noopUDPTestIO) ReceiveMessage() (*protocol.UDPMessage, error)  { return nil, nil }
-func (noopUDPTestIO) SendMessage([]byte, *protocol.UDPMessage) error { return nil }
+func (noopUDPTestIO) ReceiveMessage() (*protocol.UDPMessage, error)                   { return nil, nil }
+func (noopUDPTestIO) SendMessage(context.Context, []byte, *protocol.UDPMessage) error { return nil }
 
 func TestUDPConnWriteToSerializesSendFunc(t *testing.T) {
 	t.Helper()
@@ -36,7 +38,7 @@ func TestUDPConnWriteToSerializesSendFunc(t *testing.T) {
 		ID:        1,
 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
 		SendBuf:   make([]byte, protocol.MaxUDPSize),
-		SendFunc: func(buf []byte, msg *protocol.UDPMessage) error {
+		SendFunc: func(ctx context.Context, buf []byte, msg *protocol.UDPMessage) error {
 			if len(buf) != protocol.MaxUDPSize {
 				t.Fatalf("unexpected send buffer length: got %d want %d", len(buf), protocol.MaxUDPSize)
 			}
@@ -160,9 +162,9 @@ func TestUDPConnCloseConcurrentWrite(t *testing.T) {
 	firstWrite := make(chan struct{})
 	var firstWriteOnce sync.Once
 	originalSend := u.SendFunc
-	u.SendFunc = func(buf []byte, msg *protocol.UDPMessage) error {
+	u.SendFunc = func(ctx context.Context, buf []byte, msg *protocol.UDPMessage) error {
 		firstWriteOnce.Do(func() { close(firstWrite) })
-		return originalSend(buf, msg)
+		return originalSend(ctx, buf, msg)
 	}
 
 	u.receiverMu.Lock()
@@ -634,6 +636,12 @@ func TestUDPConnSetDeadlineZeroClearsTimer(t *testing.T) {
 		t.Fatalf("SetDeadline(zero) error = %v", err)
 	}
 	time.Sleep(75 * time.Millisecond)
+	if err := u.readDeadline.Context().Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.writeDeadline.Context().Err(); err != nil {
+		t.Fatal(err)
+	}
 	if got := closes.Load(); got != 0 {
 		t.Fatalf("CloseFunc calls after clearing deadline = %d, want 0", got)
 	}
@@ -658,33 +666,33 @@ func TestUDPConnCloseStopsDeadlineTimer(t *testing.T) {
 	}
 }
 
-func TestUDPConnDeadlineClosesSession(t *testing.T) {
-	var closes atomic.Int32
-	var closeOnce sync.Once
-	u := &udpConn{
-		ID:        1,
-		D:         &frag.Defragger{},
-		ReceiveCh: make(chan *protocol.UDPMessage, 1),
+func TestUDPConnWriteDeadlinePreservesReadAndSession(t *testing.T) {
+	m := &udpSessionManager{io: noopUDPTestIO{}, m: make(map[uint32]*udpConn), nextID: 1, done: make(chan struct{})}
+	raw, err := m.NewUDP("192.0.2.1:27015")
+	if err != nil {
+		t.Fatal(err)
 	}
-	u.CloseFunc = func() {
-		closes.Add(1)
-		closeOnce.Do(func() { close(u.ReceiveCh) })
+	u := raw.(*udpConn)
+	defer u.Close()
+	if err := u.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := u.SetDeadline(time.Now().Add(25 * time.Millisecond)); err != nil {
-		t.Fatalf("SetDeadline() error = %v", err)
+	if _, err := u.WriteTo([]byte("tick"), u.target); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("write: %v", err)
 	}
-
-	select {
-	case msg := <-u.ReceiveCh:
-		if msg != nil {
-			t.Fatalf("ReceiveCh yielded %v, want closed channel", msg)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("deadline did not close UDP session")
+	u.ReceiveCh <- &protocol.UDPMessage{Addr: []byte(u.target), Data: []byte("reply"), FragCount: 1}
+	buf := make([]byte, 64)
+	if n, _, err := u.ReadFrom(buf); err != nil || string(buf[:n]) != "reply" {
+		t.Fatalf("read: %d %v", n, err)
 	}
-	if got := closes.Load(); got != 1 {
-		t.Fatalf("CloseFunc calls after deadline = %d, want 1", got)
+	if u.closed.Load() {
+		t.Fatal("deadline closed the session")
+	}
+	if err := u.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.WriteTo([]byte("tick"), u.target); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -715,14 +723,14 @@ func TestUDPConnDeadlineCanBeAppliedWhileReadIsPending(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		if err != io.EOF {
-			t.Fatalf("ReadFrom() error = %T %v, want EOF after close", err, err)
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("ReadFrom deadline: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("ReadFrom did not unblock after deadline closed the session")
+		t.Fatal("ReadFrom did not unblock on read deadline")
 	}
-	if got := closes.Load(); got != 1 {
-		t.Fatalf("CloseFunc calls after pending read deadline = %d, want 1", got)
+	if got := closes.Load(); got != 0 {
+		t.Fatalf("read deadline closed session: %d", got)
 	}
 }
 
@@ -764,7 +772,7 @@ func TestUDPConnWriteToFragmentsWhenLocalSendBufferIsTooSmall(t *testing.T) {
 		ID:        7,
 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
 		SendBuf:   make([]byte, 32),
-		SendFunc: func(_ []byte, msg *protocol.UDPMessage) error {
+		SendFunc: func(_ context.Context, _ []byte, msg *protocol.UDPMessage) error {
 			msgCopy := *msg
 			msgCopy.Data = append([]byte(nil), msg.Data...)
 			sent = append(sent, msgCopy)
@@ -804,7 +812,7 @@ func TestUDPConnWriteToRejectsUnfragmentableDatagram(t *testing.T) {
 		ID:        7,
 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
 		SendBuf:   make([]byte, 8),
-		SendFunc: func(_ []byte, _ *protocol.UDPMessage) error {
+		SendFunc: func(_ context.Context, _ []byte, _ *protocol.UDPMessage) error {
 			t.Fatal("SendFunc should not be called when fragmentation is impossible")
 			return nil
 		},
@@ -1063,7 +1071,7 @@ func TestUDPConnWriteToRejectsUndersizedDatagram(t *testing.T) {
 		ID:        1,
 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
 		SendBuf:   make([]byte, protocol.MaxUDPSize),
-		SendFunc: func([]byte, *protocol.UDPMessage) error {
+		SendFunc: func(context.Context, []byte, *protocol.UDPMessage) error {
 			return &quic.DatagramTooLargeError{MaxDataLen: 8}
 		},
 		CloseFunc: func() {},
@@ -1081,4 +1089,66 @@ func TestUDPConnWriteToRejectsUndersizedDatagram(t *testing.T) {
 	if protoErr.Message != frag.ErrMaxSizeTooSmall.Error() {
 		t.Fatalf("ProtocolError.Message = %q, want %q", protoErr.Message, frag.ErrMaxSizeTooSmall.Error())
 	}
+}
+
+func TestUDPSessionCloseCancelsSendWithoutBlockingSibling(t *testing.T) {
+	m := &udpSessionManager{io: noopUDPTestIO{}, m: make(map[uint32]*udpConn), nextID: 1, done: make(chan struct{})}
+	raw, err := m.NewUDP("192.0.2.1:27015")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := raw.(*udpConn)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	u.SendFunc = func(ctx context.Context, _ []byte, _ *protocol.UDPMessage) error {
+		close(entered)
+		<-ctx.Done()
+		// Emulate delayed sender cleanup even after cancellation. This must no
+		// longer retain the manager's lock and block unrelated sessions.
+		<-release
+		return context.Cause(ctx)
+	}
+	written, closed := make(chan error, 1), make(chan struct{})
+	go func() { _, err := u.WriteTo([]byte("tick"), u.target); written <- err }()
+	<-entered
+	go func() { _ = u.Close(); close(closed) }()
+	select {
+	case <-u.writeDeadline.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("close did not cancel write")
+	}
+	opened := make(chan struct{})
+	go func() {
+		other, e := m.NewUDP("192.0.2.2:27016")
+		if e != nil {
+			t.Error(e)
+		} else {
+			_ = other.Close()
+		}
+		close(opened)
+	}()
+	select {
+	case <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("sibling creation blocked on sender cleanup")
+	}
+	// Wait only after releasing the simulated sender.
+	defer func() {
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Error("close did not finish")
+		}
+		select {
+		case err := <-written:
+			if !errors.Is(err, net.ErrClosed) {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("write did not return")
+		}
+	}()
+
+	releaseOnce.Do(func() { close(release) })
 }

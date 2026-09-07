@@ -743,3 +743,10 @@ func TestNewDialerKeepsDatagramsDisabled(t *testing.T) {
 		t.Fatal("juicity must keep EnableDatagrams=false")
 	}
 }
+
+func (c *juicityTestQUICConn) SendDatagramContext(ctx context.Context, p []byte) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return c.SendDatagram(p)
+}

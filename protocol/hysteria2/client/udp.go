@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -43,7 +44,7 @@ var sendBufPool = sync.Pool{
 
 type udpIO interface {
 	ReceiveMessage() (*protocol.UDPMessage, error)
-	SendMessage([]byte, *protocol.UDPMessage) error
+	SendMessage(context.Context, []byte, *protocol.UDPMessage) error
 }
 
 type udpConn struct {
@@ -51,7 +52,7 @@ type udpConn struct {
 	D         *frag.Defragger
 	ReceiveCh chan *protocol.UDPMessage
 	SendBuf   []byte
-	SendFunc  func([]byte, *protocol.UDPMessage) error
+	SendFunc  func(context.Context, []byte, *protocol.UDPMessage) error
 	CloseFunc func()
 	closed    atomic.Bool
 
@@ -64,10 +65,10 @@ type udpConn struct {
 	receiveMu sync.Mutex
 	// deliverMu serializes RegisterPacketReceiver's drain against feed's
 	// deliver/queue path so queued datagrams stay FIFO with live ones.
-	deliverMu sync.Mutex
-	muTimer   sync.Mutex
-	timer     *time.Timer
-	target    string
+	deliverMu     sync.Mutex
+	readDeadline  netproxy.PacketDeadline
+	writeDeadline netproxy.PacketDeadline
+	target        string
 	// targetBytes is target as bytes for the per-datagram default-target
 	// comparison (message addresses are byte slices since they stopped
 	// being materialized as strings on receive).
@@ -107,7 +108,16 @@ func (u *udpConn) Write(b []byte) (n int, err error) {
 
 func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 	for {
-		msg := <-u.ReceiveCh
+		ctx := u.readDeadline.Context()
+		if err := context.Cause(ctx); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
+		var msg *protocol.UDPMessage
+		select {
+		case msg = <-u.ReceiveCh:
+		case <-ctx.Done():
+			return 0, netip.AddrPort{}, context.Cause(ctx)
+		}
 		if msg == nil {
 			// Closed
 			return 0, netip.AddrPort{}, io.EOF
@@ -255,6 +265,11 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 		return 0, coreErrs.ClosedError{}
 	}
 
+	ctx := u.writeDeadline.Context()
+	if err := context.Cause(ctx); err != nil {
+		return 0, err
+	}
+
 	// Try no frag first
 	msg := &protocol.UDPMessage{
 		SessionID: u.ID,
@@ -270,7 +285,7 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	if msg.Size() > len(u.SendBuf) {
 		err = &quic.DatagramTooLargeError{MaxDataLen: int64(len(u.SendBuf))}
 	} else {
-		err = u.SendFunc(u.SendBuf, msg)
+		err = u.SendFunc(ctx, u.SendBuf, msg)
 	}
 	var errTooLarge *quic.DatagramTooLargeError
 	if errors.As(err, &errTooLarge) {
@@ -281,7 +296,7 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 			return 0, coreErrs.ProtocolError{Message: fragErr.Error()}
 		}
 		for _, fMsg := range fMsgs {
-			err := u.SendFunc(u.SendBuf, &fMsg)
+			err := u.SendFunc(ctx, u.SendBuf, &fMsg)
 			if err != nil {
 				return 0, err
 			}
@@ -293,48 +308,21 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 }
 
 func (u *udpConn) Close() error {
-	u.stopDeadlineTimer()
+	u.readDeadline.Close()
+	u.writeDeadline.Close()
 	u.CloseFunc()
 	return nil
 }
 
-func (u *udpConn) stopDeadlineTimer() {
-	u.muTimer.Lock()
-	defer u.muTimer.Unlock()
-	if u.timer != nil {
-		u.timer.Stop()
-		u.timer = nil
-	}
-}
-
 func (u *udpConn) SetDeadline(t time.Time) error {
-	u.muTimer.Lock()
-	defer u.muTimer.Unlock()
-	if u.timer != nil {
-		u.timer.Stop()
-		u.timer = nil
+	if err := u.SetReadDeadline(t); err != nil {
+		return err
 	}
-	if t.IsZero() {
-		return nil
-	}
-	u.timer = time.AfterFunc(time.Until(t), func() {
-		u.muTimer.Lock()
-		u.timer = nil
-		u.muTimer.Unlock()
-		_ = u.Close()
-	})
-	return nil
+	return u.SetWriteDeadline(t)
 }
-
-func (u *udpConn) SetReadDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return u.SetDeadline(t)
-}
-
-func (u *udpConn) SetWriteDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return u.SetDeadline(t)
-}
+func (u *udpConn) SetReadDeadline(t time.Time) error            { return u.readDeadline.Set(t) }
+func (u *udpConn) SetWriteDeadline(t time.Time) error           { return u.writeDeadline.Set(t) }
+func (u *udpConn) SupportsIndependentPacketWriteDeadline() bool { return true }
 
 type udpSessionManager struct {
 	io udpIO
@@ -474,7 +462,9 @@ func (m *udpSessionManager) closeCleanup() {
 		close(m.done)
 	}
 	var onIdle func()
+	conns := make([]*udpConn, 0, len(m.m))
 	for _, conn := range m.m {
+		conns = append(conns, conn)
 		if cb := m.closeLocked(conn); cb != nil {
 			onIdle = cb
 		}
@@ -485,6 +475,9 @@ func (m *udpSessionManager) closeCleanup() {
 	}
 	m.closed = true
 	m.mutex.Unlock()
+	for _, conn := range conns {
+		conn.releaseSendBuffer()
+	}
 
 	if onIdle != nil {
 		onIdle()
@@ -564,7 +557,6 @@ func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netp
 		transportDone: m.done,
 
 		writeMu:           sync.Mutex{},
-		muTimer:           sync.Mutex{},
 		target:            addr,
 		targetBytes:       []byte(addr),
 		writeAddrStr:      addr,
@@ -584,10 +576,23 @@ func (m *udpSessionManager) close(conn *udpConn) {
 	m.mutex.Lock()
 	onIdle := m.closeLocked(conn)
 	m.mutex.Unlock()
+	conn.releaseSendBuffer()
 
 	if onIdle != nil {
 		onIdle()
 	}
+}
+
+func (conn *udpConn) releaseSendBuffer() {
+	// WriteTo holds writeMu around Serialize+SendDatagram. Take it before
+	// returning SendBuf so a concurrent write cannot use-after-put the
+	// serialize buffer.
+	conn.writeMu.Lock()
+	if conn.SendBuf != nil {
+		sendBufPool.Put(conn.SendBuf)
+		conn.SendBuf = nil
+	}
+	conn.writeMu.Unlock()
 }
 
 func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
@@ -600,7 +605,8 @@ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
 	conn.closed.Store(true)
 	conn.receiver = nil
 	conn.receiverMu.Unlock()
-	conn.stopDeadlineTimer()
+	conn.readDeadline.Close()
+	conn.writeDeadline.Close()
 	// Return any partially-reassembled fragments to the quic-go pool; the
 	// session is dead and nobody will complete the reassembly. Take
 	// receiveMu: concurrent deliverMessage/ReadFrom hold it around D.Feed,
@@ -613,15 +619,6 @@ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
 		releaseUDPMessage(msg)
 	}
 	delete(m.m, conn.ID)
-	// WriteTo holds writeMu around Serialize+SendDatagram. Take it before
-	// returning SendBuf so a concurrent write cannot use-after-put the
-	// serialize buffer.
-	conn.writeMu.Lock()
-	if conn.SendBuf != nil {
-		sendBufPool.Put(conn.SendBuf)
-		conn.SendBuf = nil
-	}
-	conn.writeMu.Unlock()
 	if m.draining && len(m.m) == 0 {
 		onIdle := m.onIdle
 		m.onIdle = nil

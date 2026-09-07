@@ -82,7 +82,7 @@ func TestUDPIOImplSendMessageReturnsDatagramTooLargeOnSerializeOverflow(t *testi
 		Data:      bytes.Repeat([]byte("x"), 64),
 	}
 
-	err := io.SendMessage(make([]byte, 16), msg)
+	err := io.SendMessage(context.Background(), make([]byte, 16), msg)
 	var errTooLarge *quic.DatagramTooLargeError
 	if !errors.As(err, &errTooLarge) {
 		t.Fatalf("SendMessage() error = %T %v, want DatagramTooLargeError", err, err)
@@ -261,4 +261,11 @@ func TestClientCloseDefersTransportCloseUntilActiveUDPSessionsDrain(t *testing.T
 	if c.conn != nil || c.pktConn != nil || c.udpSM != nil {
 		t.Fatalf("client resources not cleared after UDP drain: conn=%v pktConn=%v udpSM=%v", c.conn, c.pktConn, c.udpSM)
 	}
+}
+
+func (c *closeTrackingQuicConn) SendDatagramContext(ctx context.Context, p []byte) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return c.SendDatagram(p)
 }

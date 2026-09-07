@@ -113,3 +113,6 @@ func SealUDP(metadata trojanc.Metadata, dst []byte, data []byte) []byte {
 	binary.BigEndian.PutUint16(dst[n:], uint16(len(data)))
 	return dst[:n+2+len(data)]
 }
+
+// The underlying QUIC stream supports independent write deadlines.
+func (c *PacketConn) SupportsIndependentPacketWriteDeadline() bool { return true }

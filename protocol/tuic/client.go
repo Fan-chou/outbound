@@ -293,6 +293,11 @@ func (t *clientImpl) deferQuicConn(quicConn quic.Connection, err error) {
 		t.forceClose(quicConn, err)
 		return
 	}
+	// Association cancellation and send-queue pressure are local, not tunnel failure.
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+		return
+	}
 	// Only close connection on non-temporary errors. Stream exhaustion is a
 	// per-attempt condition: quic-go reports it as *quic.StreamLimitReachedError
 	// ("too many open streams"), which IsStreamExhausted matches, so the shared

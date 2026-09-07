@@ -1,10 +1,10 @@
 package tuic
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -200,17 +200,12 @@ type quicStreamPacketConn struct {
 	closeErr  error
 	closed    atomic.Bool
 
-	// deadlineExceeded records that the conn was torn down by its own
-	// deadline timer rather than an explicit Close, so ReadFrom can report a
-	// timeout instead of net.ErrClosed.
-	deadlineExceeded atomic.Bool
-
 	deFraggers sync.Map
 
 	lastDeFraggerCleanupNano atomic.Int64
 
-	muTimer       sync.Mutex
-	deadlineTimer *time.Timer
+	readDeadline  netproxy.PacketDeadline
+	writeDeadline netproxy.PacketDeadline
 }
 
 var deFraggerIdleTimeout = 30 * time.Second
@@ -392,6 +387,8 @@ func (b *deFraggerBucket) feed(packet *Packet, p []byte, nowNano int64) (n int, 
 func (q *quicStreamPacketConn) Close() error {
 	q.closeOnce.Do(func() {
 		q.closed.Store(true)
+		q.readDeadline.Close()
+		q.writeDeadline.Close()
 		q.closeErr = q.close()
 	})
 	return q.closeErr
@@ -432,8 +429,12 @@ func (q *quicStreamPacketConn) close() (err error) {
 		if err != nil {
 			return
 		}
+		// Dissociate is best effort. A flow-controlled control stream must not
+		// turn association Close into an unbounded wait after cancelling UDP.
+		_ = stream.SetWriteDeadline(time.Now().Add(time.Second))
 		_, err = buf.WriteTo(stream)
 		if err != nil {
+			stream.CancelWrite(0)
 			return
 		}
 		err = stream.Close()
@@ -475,41 +476,15 @@ func (q *quicStreamPacketConn) maybeCleanupDeFraggers(nowNano int64) {
 }
 
 func (q *quicStreamPacketConn) SetDeadline(t time.Time) error {
-	q.muTimer.Lock()
-	defer q.muTimer.Unlock()
-	if t.IsZero() {
-		// A zero time clears the deadline per the net.Conn contract;
-		// time.Until would yield a hugely negative duration and fire the
-		// close callback immediately.
-		if q.deadlineTimer != nil {
-			q.deadlineTimer.Stop()
-			q.deadlineTimer = nil
-		}
-		return nil
+	if err := q.SetReadDeadline(t); err != nil {
+		return err
 	}
-	dur := time.Until(t)
-	if q.deadlineTimer != nil {
-		q.deadlineTimer.Reset(dur)
-	} else {
-		q.deadlineTimer = time.AfterFunc(dur, func() {
-			q.muTimer.Lock()
-			defer q.muTimer.Unlock()
-			q.deadlineExceeded.Store(true)
-			_ = q.Close()
-			q.deadlineTimer = nil
-		})
-	}
-	return nil
+	return q.SetWriteDeadline(t)
 }
-
-func (q *quicStreamPacketConn) SetReadDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return q.SetDeadline(t)
-}
-
-func (q *quicStreamPacketConn) SetWriteDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return q.SetDeadline(t)
+func (q *quicStreamPacketConn) SetReadDeadline(t time.Time) error  { return q.readDeadline.Set(t) }
+func (q *quicStreamPacketConn) SetWriteDeadline(t time.Time) error { return q.writeDeadline.Set(t) }
+func (q *quicStreamPacketConn) SupportsIndependentPacketWriteDeadline() bool {
+	return q.udpRelayMode != common.QUIC
 }
 
 func (q *quicStreamPacketConn) addrPortFrom(addr *Address) netip.AddrPort {
@@ -541,21 +516,21 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 	q.mu.Unlock()
 
 	if incomingPackets == nil {
-		if q.deadlineExceeded.Load() {
-			return 0, netip.AddrPort{}, os.ErrDeadlineExceeded
-		}
 		return 0, netip.AddrPort{}, net.ErrClosed
 	}
-
+	ctx := q.readDeadline.Context()
 	for {
-		packet, closed := incomingPackets.PopFrontBlock()
-		if closed {
-			if q.deadlineExceeded.Load() {
-				err = os.ErrDeadlineExceeded
-			} else {
-				err = net.ErrClosed
+		if err := context.Cause(ctx); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
+		var packet *Packet
+		select {
+		case packet = <-incomingPackets.ch:
+			if packet == nil {
+				return 0, netip.AddrPort{}, net.ErrClosed
 			}
-			return
+		case <-ctx.Done():
+			return 0, netip.AddrPort{}, context.Cause(ctx)
 		}
 		if packet.FRAG_TOTAL <= 1 {
 			if packet.ADDR == nil {
@@ -692,6 +667,10 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 	}
 	q.writeMu.Lock()
 	defer q.writeMu.Unlock()
+	ctx := q.writeDeadline.Context()
+	if err := context.Cause(ctx); err != nil {
+		return 0, err
+	}
 	// Conn-private serialization scratch: grown to this association's peak
 	// frame once, then reused without touching the shared pool. Nil-ed on
 	// Close so a closed association does not pin its peak size.
@@ -728,7 +707,7 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 		if err != nil {
 			return
 		}
-		err = q.quicConn.SendDatagram(buf.Bytes())
+		err = q.quicConn.SendDatagramContext(ctx, buf.Bytes())
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) {
 			firstHeaderLen := packet.BytesLen() - len(packet.DATA)
@@ -736,7 +715,7 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 			if q.maxUdpRelayPacketSize > 0 && fragSize > q.maxUdpRelayPacketSize {
 				fragSize = q.maxUdpRelayPacketSize
 			}
-			err = fragWriteNative(q.quicConn, packet, buf, fragSize)
+			err = fragWriteNativeContext(ctx, q.quicConn, packet, buf, fragSize)
 		}
 		if err != nil {
 			return

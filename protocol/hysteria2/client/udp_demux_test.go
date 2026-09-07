@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,7 @@ func (io *chanUDPIO) ReceiveMessage() (*protocol.UDPMessage, error) {
 	}
 }
 
-func (io *chanUDPIO) SendMessage([]byte, *protocol.UDPMessage) error { return nil }
+func (io *chanUDPIO) SendMessage(context.Context, []byte, *protocol.UDPMessage) error { return nil }
 
 // TestUDPSessionManagerDemuxPreservesPerSessionOrder is the ordering
 // counterpart of the parallel-demux test above: datagrams of one session

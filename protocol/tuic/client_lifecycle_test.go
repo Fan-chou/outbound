@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -47,6 +48,13 @@ func TestDeferQuicConnKeepsAliveOnDatagramQueueTimeout(t *testing.T) {
 	if closed.Load() {
 		t.Fatal("live-connection datagram send-queue timeout must not invoke the client close callback")
 	}
+	for _, err := range []error{net.ErrClosed, context.Canceled, os.ErrDeadlineExceeded} {
+		client.deferQuicConn(live, err)
+		if client.closed.Load() {
+			t.Fatalf("association-local error closed transport: %v", err)
+		}
+	}
+
 }
 
 func TestDeferQuicConnStillClosesOnPermanentError(t *testing.T) {
@@ -173,4 +181,11 @@ func TestDeferQuicConnRetiresClosedConnectionOnTemporaryError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("closed-connection temporary errors must invoke the client close callback")
 	}
+}
+
+func (c *lifecycleQuicConn) SendDatagramContext(ctx context.Context, p []byte) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return c.SendDatagram(p)
 }

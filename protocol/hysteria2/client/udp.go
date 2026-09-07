@@ -270,6 +270,7 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 		return 0, err
 	}
 
+	udpOriginalPackets.Add(1)
 	// Try no frag first
 	msg := &protocol.UDPMessage{
 		SessionID: u.ID,
@@ -295,7 +296,9 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 		if fragErr != nil {
 			return 0, coreErrs.ProtocolError{Message: fragErr.Error()}
 		}
+		udpFragmentedPackets.Add(1)
 		for _, fMsg := range fMsgs {
+			udpFragmentAttempts.Add(1)
 			err := u.SendFunc(ctx, u.SendBuf, &fMsg)
 			if err != nil {
 				return 0, err
@@ -409,8 +412,10 @@ func (m *udpSessionManager) routeDemux() {
 		// system could have processed. m.done unblocks a send parked on a
 		// full worker queue when the manager is closed (Close / transport
 		// death) so closeCleanup does not wait on ReceiveMessage.
+		dispatchStarted := demuxDispatchWait.start()
 		select {
 		case ch <- msg:
+			demuxDispatchWait.finish(dispatchStarted)
 		case <-m.done:
 			releaseUDPMessage(msg)
 			return

@@ -9,9 +9,15 @@ import (
 // demuxWaitObservation samples one operation in 64. Buckets are disjoint and
 // describe local waiting, not end-to-end latency or successful delivery.
 // The snapshot is served by the existing localhost diagnostics listener.
+type demuxSlowSample struct {
+	At           string  `json:"at"`
+	Milliseconds float64 `json:"milliseconds"`
+}
+
 type demuxWaitObservation struct {
 	operations atomic.Uint64
-	buckets    [7]atomic.Uint64
+	lastSlow   atomic.Pointer[demuxSlowSample]
+	buckets    [9]atomic.Uint64
 }
 
 func (o *demuxWaitObservation) start() time.Time {
@@ -26,12 +32,15 @@ func (o *demuxWaitObservation) finish(start time.Time) {
 		return
 	}
 	elapsed := time.Since(start)
-	limits := [...]time.Duration{time.Millisecond, 5 * time.Millisecond, 20 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, time.Second}
+	limits := [...]time.Duration{time.Millisecond, 5 * time.Millisecond, 20 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond, time.Second}
 	i := 0
 	for i < len(limits) && elapsed > limits[i] {
 		i++
 	}
 	o.buckets[i].Add(1)
+	if elapsed >= 100*time.Millisecond {
+		o.lastSlow.Store(&demuxSlowSample{At: time.Now().UTC().Format(time.RFC3339Nano), Milliseconds: float64(elapsed) / float64(time.Millisecond)})
+	}
 }
 
 func (o *demuxWaitObservation) snapshot() map[string]any {
@@ -39,7 +48,7 @@ func (o *demuxWaitObservation) snapshot() map[string]any {
 	for i := range counts {
 		counts[i] = o.buckets[i].Load()
 	}
-	return map[string]any{"operations": o.operations.Load(), "sample_every": 64, "bucket_upper_ms": []string{"1", "5", "20", "50", "100", "1000", "+Inf"}, "samples": counts}
+	return map[string]any{"last_slow_sample": o.lastSlow.Load(), "operations": o.operations.Load(), "sample_every": 64, "bucket_upper_ms": []string{"1", "5", "20", "50", "100", "200", "500", "1000", "+Inf"}, "samples": counts}
 }
 
 var demuxDispatchWait demuxWaitObservation

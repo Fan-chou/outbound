@@ -80,7 +80,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 			return nil, err
 		}
 
-		c, err := d.nextDialer.DialContext(ctx, network, d.addr)
+		c, err := d.nextDialer.DialContext(ctx, magicNetwork.ForProxyHop("udp"), d.addr)
 		if err != nil {
 			return nil, fmt.Errorf("dial to %v error: %w", d.addr, err)
 		}
@@ -90,13 +90,17 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 	}
 }
 
-func (d *Dialer) DialTcpTransport(ctx context.Context, magicNetwork string) (netproxy.Conn, error) {
+func (d *Dialer) DialTcpTransport(ctx context.Context, network string) (netproxy.Conn, error) {
+	magicNetwork, err := netproxy.ParseMagicNetwork(network)
+	if err != nil {
+		return nil, err
+	}
 	ciph, err := ciphers.NewStreamCipher(d.EncryptMethod, d.EncryptPassword)
 	if err != nil {
 		return nil, err
 	}
 
-	c, err := d.nextDialer.DialContext(ctx, magicNetwork, d.addr)
+	c, err := d.nextDialer.DialContext(ctx, magicNetwork.ForProxyHop("tcp"), d.addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial to %v error: %w", d.addr, err)
 	}

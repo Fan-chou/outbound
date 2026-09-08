@@ -21,6 +21,15 @@ type MagicNetwork struct {
 	IPVersion string
 }
 
+// ForProxyHop constructs the network for a proxy server or relay rather than
+// the encapsulated destination. Each hop chooses its own address family.
+// Keep socket policy options when crossing this protocol boundary.
+func (mn MagicNetwork) ForProxyHop(network string) string {
+	mn.Network = network
+	mn.IPVersion = ""
+	return mn.Encode()
+}
+
 func (mn MagicNetwork) Encode() string {
 	if len([]byte(mn.Network)) > 255 {
 		panic("network too long")

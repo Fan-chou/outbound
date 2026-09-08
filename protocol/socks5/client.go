@@ -30,7 +30,7 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 	}
 	switch magicNetwork.Network {
 	case "tcp":
-		c, err := s.dialer.DialContext(ctx, network, s.addr)
+		c, err := s.dialer.DialContext(ctx, magicNetwork.ForProxyHop("tcp"), s.addr)
 		if err != nil {
 			return nil, fmt.Errorf("[socks5]: dial to %s error: %w", s.addr, err)
 		}

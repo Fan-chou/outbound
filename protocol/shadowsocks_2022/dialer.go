@@ -101,7 +101,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 			return nil, err
 		}
 		// Shadowsocks transfer TCP traffic via TCP tunnel.
-		conn, err := d.parentDialer.DialContext(ctx, network, d.proxyAddress)
+		conn, err := d.parentDialer.DialContext(ctx, magicNetwork.ForProxyHop("tcp"), d.proxyAddress)
 		if err != nil {
 			return nil, err
 		}
@@ -132,8 +132,7 @@ func (d *Dialer) ListenPacket(ctx context.Context, network string, addr string) 
 		return nil, err
 	}
 	// Shadowsocks transfer UDP traffic via UDP tunnel.
-	magicNetwork.Network = "udp"
-	network = magicNetwork.Encode()
+	network = magicNetwork.ForProxyHop("udp")
 	conn, err := d.parentDialer.DialContext(ctx, network, d.proxyAddress)
 	if err != nil {
 		return nil, err

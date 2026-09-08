@@ -113,13 +113,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			return nil, err
 		}
 		mdata.IsClient = true
-		udpNetwork := network
-		if magicNetwork.Network == "tcp" {
-			udpNetwork = netproxy.MagicNetwork{
-				Network: "udp",
-				Mark:    magicNetwork.Mark,
-			}.Encode()
-		}
+		udpNetwork := magicNetwork.ForProxyHop("udp")
 		if magicNetwork.Network == "udp" {
 			switch mdata.Port {
 			// case 443, 8443, 5201:

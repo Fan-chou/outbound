@@ -69,7 +69,13 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 			uAddress = net.JoinHostPort(h, p)
 		}
 
-		conn, err := s.dialer.DialContext(ctx, network, uAddress)
+		// UDP ASSOCIATE may return a different address family than the control
+		// endpoint. Do not carry that endpoint's family hint into the relay
+		// connection, or force the inner target's family onto a chained proxy.
+		// The next dialer can choose from the actual relay / next-hop address.
+		relayNetwork := *magicNetwork
+		relayNetwork.IPVersion = ""
+		conn, err := s.dialer.DialContext(ctx, relayNetwork.Encode(), uAddress)
 		if err != nil {
 			_ = c.Close()
 			return nil, fmt.Errorf("[socks5] dialudp to %s error: %w", uAddress, err)

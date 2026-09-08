@@ -33,7 +33,7 @@ func TestDirectPacketConnWriteToUsesDialTargetCache(t *testing.T) {
 	defer func() { resolveUDPAddr = oldResolve }()
 
 	var calls atomic.Int32
-	resolveUDPAddr = func(_ context.Context, resolver *net.Resolver, hostport string) (*net.UDPAddr, error) {
+	resolveUDPAddr = func(_ context.Context, resolver *net.Resolver, _ string, hostport string) (*net.UDPAddr, error) {
 		calls.Add(1)
 		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(
 			netip.AddrFrom4([4]byte{127, 0, 0, 1}),
@@ -77,7 +77,7 @@ func TestDirectPacketConnWriteToCachesAlternateTarget(t *testing.T) {
 	defer func() { resolveUDPAddr = oldResolve }()
 
 	var calls atomic.Int32
-	resolveUDPAddr = func(_ context.Context, resolver *net.Resolver, hostport string) (*net.UDPAddr, error) {
+	resolveUDPAddr = func(_ context.Context, resolver *net.Resolver, _ string, hostport string) (*net.UDPAddr, error) {
 		calls.Add(1)
 		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(
 			netip.AddrFrom4([4]byte{127, 0, 0, 1}),

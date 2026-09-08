@@ -106,7 +106,7 @@ func TestDirectDNSDeadlineChangeAndRetry(t *testing.T) {
 			var once sync.Once
 			old := resolveUDPAddr
 			t.Cleanup(func() { resolveUDPAddr = old })
-			resolveUDPAddr = func(ctx context.Context, _ *net.Resolver, _ string) (*net.UDPAddr, error) {
+			resolveUDPAddr = func(ctx context.Context, _ *net.Resolver, _, _ string) (*net.UDPAddr, error) {
 				calls.Add(1)
 				once.Do(func() { close(entered) })
 				select {

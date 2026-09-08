@@ -179,6 +179,20 @@ func preferredNetwork(baseNetwork, ipVersion string) string {
 
 func (d *directDialer) dialUdp(ctx context.Context, addr string, mark int, ipVersion string, fallback bool) (c netproxy.PacketConn, err error) {
 	network := preferredNetwork("udp", ipVersion)
+	resolveNetwork := "ip"
+	switch network {
+	case "udp4":
+		resolveNetwork = "ip4"
+	case "udp6":
+		resolveNetwork = "ip6"
+	default:
+		// Binding a concrete local address restricts an otherwise generic UDP socket.
+		if d.udpLocalAddr != nil && d.udpLocalAddr.IP.To4() != nil && !d.udpLocalAddr.IP.IsUnspecified() {
+			resolveNetwork = "ip4"
+		} else if d.udpLocalAddr != nil && len(d.udpLocalAddr.IP) != 0 && !d.udpLocalAddr.IP.IsUnspecified() {
+			resolveNetwork = "ip6"
+		}
+	}
 	if d.Option.FallbackDNS != "" && !fallback {
 		defer func() { // don't remove func wrapper for d.tryRetry
 			d.tryRetry(err, addr, func() {
@@ -193,7 +207,7 @@ func (d *directDialer) dialUdp(ctx context.Context, addr string, mark int, ipVer
 			if err != nil {
 				return nil, err
 			}
-			return &directPacketConn{UDPConn: conn, FullCone: true, dialTgt: addr, resolver: resolver, receiver: d.receiver}, nil
+			return &directPacketConn{resolveNetwork: resolveNetwork, UDPConn: conn, FullCone: true, dialTgt: addr, resolver: resolver, receiver: d.receiver}, nil
 		} else {
 			dialer := net.Dialer{
 				LocalAddr: d.udpLocalAddr,
@@ -203,7 +217,7 @@ func (d *directDialer) dialUdp(ctx context.Context, addr string, mark int, ipVer
 			if err != nil {
 				return nil, err
 			}
-			return &directPacketConn{UDPConn: conn.(*net.UDPConn), FullCone: false, dialTgt: addr, resolver: resolver, receiver: d.receiver}, nil
+			return &directPacketConn{resolveNetwork: resolveNetwork, UDPConn: conn.(*net.UDPConn), FullCone: false, dialTgt: addr, resolver: resolver, receiver: d.receiver}, nil
 		}
 
 	} else {
@@ -238,7 +252,7 @@ func (d *directDialer) dialUdp(ctx context.Context, addr string, mark int, ipVer
 			}
 			conn = c.(*net.UDPConn)
 		}
-		return &directPacketConn{UDPConn: conn, FullCone: d.Option.FullCone, dialTgt: addr, resolver: &net.Resolver{
+		return &directPacketConn{resolveNetwork: resolveNetwork, UDPConn: conn, FullCone: d.Option.FullCone, dialTgt: addr, resolver: &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 				dialer := net.Dialer{

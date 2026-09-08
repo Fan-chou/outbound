@@ -195,6 +195,12 @@ func ResolveUDPAddr(resolver *net.Resolver, hostport string) (*net.UDPAddr, erro
 
 // ResolveUDPAddrContext keeps the DNS budget inside the caller lifetime.
 func ResolveUDPAddrContext(ctx context.Context, resolver *net.Resolver, hostport string) (*net.UDPAddr, error) {
+	return ResolveUDPAddrNetworkContext(ctx, resolver, "ip", hostport)
+}
+
+// ResolveUDPAddrNetworkContext restricts answers to the socket address family.
+// network is ip, ip4 or ip6; ip preserves the dual-stack IPv4 preference.
+func ResolveUDPAddrNetworkContext(ctx context.Context, resolver *net.Resolver, network, hostport string) (*net.UDPAddr, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	host, _port, err := net.SplitHostPort(hostport)
@@ -205,7 +211,7 @@ func ResolveUDPAddrContext(ctx context.Context, resolver *net.Resolver, hostport
 	if err != nil {
 		return nil, fmt.Errorf("invalid port: %v", _port)
 	}
-	addrs, err := resolver.LookupNetIP(ctx, "ip", host)
+	addrs, err := resolver.LookupNetIP(ctx, network, host)
 	if err != nil {
 		return nil, err
 	}

@@ -59,7 +59,11 @@ func (c *directPacketConn) resolveAddr(target string) (netip.AddrPort, error) {
 	c.armResolutionDeadlineLocked()
 	c.resolveMu.Unlock()
 
-	addr, err := resolveUDPAddr(ctx, c.resolver, target)
+	network := c.resolveNetwork
+	if network == "" {
+		network = "ip"
+	}
+	addr, err := resolveUDPAddr(ctx, c.resolver, network, target)
 	c.resolveMu.Lock()
 	if cause := context.Cause(ctx); cause != nil {
 		err = cause

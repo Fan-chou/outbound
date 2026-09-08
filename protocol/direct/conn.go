@@ -14,12 +14,13 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-var resolveUDPAddr = common.ResolveUDPAddrContext
+var resolveUDPAddr = common.ResolveUDPAddrNetworkContext
 
 type directPacketConn struct {
 	directResolveState
 	*net.UDPConn
 	FullCone           bool
+	resolveNetwork     string // ip4/ip6 for restricted sockets; empty means dual-stack
 	dialTgt            string
 	receiver           *packetReceiverRegistry
 	receiverMu         sync.Mutex

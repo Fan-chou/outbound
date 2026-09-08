@@ -14,9 +14,10 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-var resolveUDPAddr = common.ResolveUDPAddr
+var resolveUDPAddr = common.ResolveUDPAddrContext
 
 type directPacketConn struct {
+	directResolveState
 	*net.UDPConn
 	FullCone           bool
 	dialTgt            string
@@ -26,7 +27,6 @@ type directPacketConn struct {
 	receiverGeneration uint64
 	cachedDialTgt      atomic.Value // stores netip.AddrPort
 	writeTgtCache      common.LastStringValue[netip.AddrPort]
-	cacheMu            sync.Mutex // serializes lazy dial-target resolution in resolveTarget
 	resolver           *net.Resolver
 	batchOnce          sync.Once
 	batchWriter        packetBatchWriter
@@ -35,6 +35,7 @@ type directPacketConn struct {
 // Close unregisters the socket from the shared packet receiver before closing
 // its underlying UDP descriptor.
 func (c *directPacketConn) Close() error {
+	c.cancelResolution()
 	c.stopPacketReceiver()
 	if c.UDPConn == nil {
 		return nil
@@ -185,46 +186,25 @@ func (c *directPacketConn) writeBatchAlloc(items []netproxy.BatchItem) (int, err
 }
 
 func (c *directPacketConn) resolveTarget() error {
-	// Retryable by design: a failure must not be memoized for the lifetime
-	// of the conn (fullcone UDP relays live for hours — a transient resolver
-	// outage at first write would otherwise fail every later write).
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-	if c.cachedDialTgt.Load() != nil {
-		return nil
+	_, err := c.resolveAddr(c.dialTgt)
+	return err
+}
+
+func (c *directPacketConn) cachedTarget(addr string) (netip.AddrPort, bool) {
+	if addr == c.dialTgt {
+		if cached := c.cachedDialTgt.Load(); cached != nil {
+			return cached.(netip.AddrPort), true
+		}
+		return netip.AddrPort{}, false
 	}
-	ua, err := resolveUDPAddr(c.resolver, c.dialTgt)
-	if err != nil {
-		return err
-	}
-	// Store the value directly, not a pointer to a stack variable.
-	// atomic.Value stores the value on heap, ensuring memory safety.
-	resolved := ua.AddrPort()
-	ap := netip.AddrPortFrom(resolved.Addr().Unmap(), resolved.Port())
-	c.cachedDialTgt.Store(ap)
-	return nil
+	return c.writeTgtCache.Load(addr)
 }
 
 func (c *directPacketConn) writeTargetAddrPort(addr string) (netip.AddrPort, error) {
-	if addr == c.dialTgt {
-		if c.cachedDialTgt.Load() == nil {
-			if err := c.resolveTarget(); err != nil {
-				return netip.AddrPort{}, err
-			}
-		}
-		return c.cachedDialTgt.Load().(netip.AddrPort), nil
-	}
-	if cached, ok := c.writeTgtCache.Load(addr); ok {
+	if cached, ok := c.cachedTarget(addr); ok {
 		return cached, nil
 	}
-	uAddr, err := resolveUDPAddr(c.resolver, addr)
-	if err != nil {
-		return netip.AddrPort{}, err
-	}
-	resolved := uAddr.AddrPort()
-	target := netip.AddrPortFrom(resolved.Addr().Unmap(), resolved.Port())
-	c.writeTgtCache.Store(addr, target)
-	return target, nil
+	return c.resolveAddr(addr)
 }
 
 func (c *directPacketConn) Write(b []byte) (int, error) {
@@ -234,7 +214,7 @@ func (c *directPacketConn) Write(b []byte) (int, error) {
 
 	// Lazy target resolution with thread-safe initialization.
 	// Thread-safety guarantees:
-	// 1. cacheMu in resolveTarget() provides happens-before relationship
+	// 1. resolveMu serializes cache publication and pending DNS lookups
 	// 2. atomic.Value.Load/Store provides atomic access to the cached value
 	// 3. The netip.AddrPort value is stored directly in atomic.Value (heap-allocated)
 	if c.cachedDialTgt.Load() == nil {

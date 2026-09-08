@@ -1,6 +1,7 @@
 package direct
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -66,7 +67,7 @@ func TestDirectPacketConnWriteBatchFullCone(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	oldResolveUDPAddr := resolveUDPAddr
-	resolveUDPAddr = func(_ *net.Resolver, addr string) (*net.UDPAddr, error) {
+	resolveUDPAddr = func(_ context.Context, _ *net.Resolver, addr string) (*net.UDPAddr, error) {
 		if addr == "a.example:53" {
 			return serverA.LocalAddr().(*net.UDPAddr), nil
 		}
@@ -112,7 +113,7 @@ func TestDirectPacketConnWriteBatchInvalidAddrReturnsZero(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	oldResolveUDPAddr := resolveUDPAddr
-	resolveUDPAddr = func(_ *net.Resolver, addr string) (*net.UDPAddr, error) {
+	resolveUDPAddr = func(_ context.Context, _ *net.Resolver, addr string) (*net.UDPAddr, error) {
 		if addr == "good.example:53" {
 			return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, nil
 		}

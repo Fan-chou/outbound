@@ -190,7 +190,12 @@ func HeadOverlap(p, b []byte) bool {
 }
 
 func ResolveUDPAddr(resolver *net.Resolver, hostport string) (*net.UDPAddr, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	return ResolveUDPAddrContext(context.Background(), resolver, hostport)
+}
+
+// ResolveUDPAddrContext keeps the DNS budget inside the caller lifetime.
+func ResolveUDPAddrContext(ctx context.Context, resolver *net.Resolver, hostport string) (*net.UDPAddr, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	host, _port, err := net.SplitHostPort(hostport)
 	if err != nil {

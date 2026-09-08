@@ -30,7 +30,7 @@ func TestDirectPacketConnConcurrentWriteInitializesCachedTargetSafely(t *testing
 	defer func() { _ = client.Close() }()
 
 	oldResolveUDPAddr := resolveUDPAddr
-	resolveUDPAddr = func(_ *net.Resolver, _ string) (*net.UDPAddr, error) {
+	resolveUDPAddr = func(_ context.Context, _ *net.Resolver, _ string) (*net.UDPAddr, error) {
 		return server.LocalAddr().(*net.UDPAddr), nil
 	}
 	defer func() {

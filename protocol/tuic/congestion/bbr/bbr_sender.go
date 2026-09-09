@@ -20,7 +20,7 @@ import (
 //
 
 const (
-	minBps = 65536 // 64 kbps
+	minBps = 65536 // 64 KiB/s
 
 	invalidPacketNumber            = -1
 	initialCongestionWindowPackets = 32
@@ -520,7 +520,10 @@ func (b *bbrSender) bandwidthEstimate() Bandwidth {
 }
 
 func (b *bbrSender) bandwidthForPacer() congestion.ByteCount {
-	bps := congestion.ByteCount(float64(b.bandwidthEstimate()) * b.congestionWindowGain / float64(BytesPerSecond))
+	// Pacing and congestion-window gains serve different purposes. Use the
+	// rate computed by the BBR state machine so probing and draining actually
+	// change the sender pace. Bandwidth is stored in bits per second.
+	bps := congestion.ByteCount(b.PacingRate() / BytesPerSecond)
 	if bps < minBps {
 		// We need to make sure that the bandwidth value for pacer is never zero,
 		// otherwise it will go into an edge case where HasPacingBudget = false

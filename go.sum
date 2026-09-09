@@ -4,6 +4,8 @@ github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d h1:GQNKnrRvEYyzYS
 github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185 h1:sX+DiAluUPnZbf1UEwv4finfyM1gijJr1VAOzsTQhRA=
 github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
+github.com/Fan-chou/quic-go v0.0.0-20260909151702-8fd15d6d9062 h1:3jfLJF5j2KUYHTS594llhzM6m752HACue8r2laU4kMA=
+github.com/Fan-chou/quic-go v0.0.0-20260909151702-8fd15d6d9062/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/andybalholm/brotli v1.0.6 h1:Yf9fFpf49Zrxb9NlQaluyE92/+X7UVHlhMNJN2sxfOI=
 github.com/andybalholm/brotli v1.0.6/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
 github.com/awnumar/fastrand v0.0.0-20210315215012-30ee0990fa2d h1:NkqtWyrOjr0QK1FSCmXS6Whbwh100Qt74SaRn92PemU=
@@ -86,12 +88,12 @@ github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb/go.mod h1:b
 github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ=
 github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVsIT4qYEQ=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
+github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
 github.com/stretchr/testify v1.4.0/go.mod h1:j7eGeouHqKxXV5pUuKE4zz7dFj8WfuZ+81PSLYec5m4=
 github.com/stretchr/testify v1.6.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
-github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
-github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 gitlab.com/yawning/chacha20.git v0.0.0-20230427033715-7877545b1b37 h1:ZrWBE3u/o9cHU2mySXf1687MaK09JOeZt1A+fHnCjmU=
 gitlab.com/yawning/chacha20.git v0.0.0-20230427033715-7877545b1b37/go.mod h1:3x6b94nWCP/a2XB/joOPMiGYUBvqbLfeY/BkHLeDs6s=
 go.opentelemetry.io/otel v1.29.0 h1:PdomN/Al4q/lN6iBJEN3AwPvUiHPMlt93c8bqTG5Llw=
@@ -121,9 +123,9 @@ golang.org/x/sys v0.0.0-20190902133755-9109b7679e13/go.mod h1:h1NjWce9XRLGQEsW7w
 golang.org/x/sys v0.0.0-20220715151400-c0bba94af5f8/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
 golang.org/x/sys v0.31.0 h1:ioabZlmFYtWhL+TRYpcnNlLwhyxaM9kWTDEmfnprqik=
 golang.org/x/sys v0.31.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
-golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
 golang.org/x/text v0.23.0 h1:D71I7dUrlY+VX0gQShAThNGHFxZ13dGLBHQLVl1mJlY=
 golang.org/x/text v0.23.0/go.mod h1:/BLNzu4aZCJ1+kcD0DNRotWKage4q2rGVAg4o22unh4=
+golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
 golang.org/x/time v0.5.0 h1:o7cqy6amK/52YcAKIPlM3a+Fpj35zvRj2TP+e1xFSfk=
 golang.org/x/time v0.5.0/go.mod h1:3BpzKBy/shNhVucY/MWOyx10tF3SFh9QdLuxbVysPQM=
 golang.org/x/tools v0.29.0 h1:Xx0h3TtM9rzQpQuR4dKLrdglAmCEN5Oi+P74JdhdzXE=

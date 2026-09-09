@@ -61,8 +61,11 @@ type udpConn struct {
 	// to detect transport death without waiting for ReadFrom/WriteTo errors.
 	transportDone <-chan struct{}
 
-	writeMu   sync.Mutex
-	receiveMu sync.Mutex
+	writeWaiters     atomic.Int32
+	writeLocked      atomic.Bool
+	pendingDatagrams func() int // immutable after session creation
+	writeMu          sync.Mutex
+	receiveMu        sync.Mutex
 	// deliverMu serializes RegisterPacketReceiver's drain against feed's
 	// deliver/queue path so queued datagrams stay FIFO with live ones.
 	deliverMu     sync.Mutex
@@ -259,8 +262,11 @@ func (u *udpConn) queueIfNoReceiver(msg *protocol.UDPMessage) bool {
 }
 
 func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
+	u.writeWaiters.Add(1)
 	u.writeMu.Lock()
-	defer u.writeMu.Unlock()
+	u.writeWaiters.Add(-1)
+	u.writeLocked.Store(true)
+	defer func() { u.writeLocked.Store(false); u.writeMu.Unlock() }()
 	if u.closed.Load() || u.SendBuf == nil {
 		return 0, coreErrs.ClosedError{}
 	}
@@ -569,6 +575,9 @@ func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netp
 		defaultTargetAddr: defaultTargetAddr,
 		natIdentity:       natIdentity,
 	}
+	if observer, ok := m.io.(interface{ DatagramSendQueueLen() int }); ok {
+		conn.pendingDatagrams = observer.DatagramSendQueueLen
+	}
 	conn.CloseFunc = func() {
 		m.close(conn)
 	}
@@ -648,4 +657,14 @@ func (m *udpSessionManager) Count() int {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 	return len(m.m)
+}
+
+// UDPWriteState is a connection-wide, point-in-time diagnostic. Other flows
+// sharing this session may be waiting too; it does not identify a caller.
+func (u *udpConn) UDPWriteState() (lockWaiters int32, lockHeld bool, pendingDatagrams int) {
+	pendingDatagrams = -1
+	if u.pendingDatagrams != nil {
+		pendingDatagrams = u.pendingDatagrams()
+	}
+	return u.writeWaiters.Load(), u.writeLocked.Load(), pendingDatagrams
 }

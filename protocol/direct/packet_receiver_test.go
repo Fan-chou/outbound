@@ -4,8 +4,10 @@ package direct
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"net/netip"
+	"runtime"
 	"testing"
 	"time"
 
@@ -184,10 +186,10 @@ func TestDirectPacketReceiverDeliversBelow8KiBOnSmallTier(t *testing.T) {
 	small := bytes.Repeat([]byte("a"), 1200)
 	mid := bytes.Repeat([]byte("b"), 3000)
 	mustUnixSend(t, peer, small)
-	defaultPacketReceiverRegistry.drain(entry)
+	(&packetReceiverRegistry{}).drain(entry)
 	assertDirectReceiverPacket(t, packets, string(small), netip.AddrPort{})
 	mustUnixSend(t, peer, mid)
-	defaultPacketReceiverRegistry.drain(entry)
+	(&packetReceiverRegistry{}).drain(entry)
 	assertDirectReceiverPacket(t, packets, string(mid), netip.AddrPort{})
 }
 
@@ -203,11 +205,72 @@ func TestDirectPacketReceiverDeliversFirstJumboDatagram(t *testing.T) {
 
 	jumbo := bytes.Repeat([]byte("z"), 20000)
 	mustUnixSend(t, peer, jumbo)
-	defaultPacketReceiverRegistry.drain(entry)
+	(&packetReceiverRegistry{}).drain(entry)
 	assertDirectReceiverPacket(t, packets, string(jumbo), netip.AddrPort{})
 
 	small := bytes.Repeat([]byte("s"), 512)
 	mustUnixSend(t, peer, small)
-	defaultPacketReceiverRegistry.drain(entry)
+	(&packetReceiverRegistry{}).drain(entry)
 	assertDirectReceiverPacket(t, packets, string(small), netip.AddrPort{})
+}
+
+func TestDirectPacketReceiverBurstAllowsConsumer(t *testing.T) {
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
+	server := mustListenDirectReceiverUDP(t)
+	defer server.Close()
+	client := mustListenDirectReceiverUDP(t)
+	conn := &directPacketConn{UDPConn: client, FullCone: true, receiver: defaultPacketReceiverRegistry}
+	defer conn.Close()
+	if err := client.SetReadBuffer(1 << 20); err != nil {
+		t.Fatal(err)
+	}
+	const total = 512
+	for i := 0; i < total; i++ {
+		b := make([]byte, 38)
+		binary.BigEndian.PutUint32(b, uint32(i))
+		writeDirectReceiverPacket(t, server, client, b)
+	}
+	packets := make(chan *netproxy.ReceivedPacket, 256)
+	delivered := make(chan uint32, total)
+	quit, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case packet := <-packets:
+				if packet.Err == nil && len(packet.Data) >= 4 {
+					delivered <- binary.BigEndian.Uint32(packet.Data)
+				}
+				packet.Release()
+			case <-quit:
+				return
+			}
+		}
+	}()
+	defer func() { close(quit); <-stopped }()
+	stop, ok := conn.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+		select {
+		case packets <- packet:
+			return true
+		default:
+			return false
+		}
+	})
+	if !ok {
+		t.Fatal("receiver registration failed")
+	}
+	defer stop()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for i := 0; i < total; i++ {
+		select {
+		case id := <-delivered:
+			if id != uint32(i) {
+				t.Fatalf("packet %d: got %d", i, id)
+			}
+		case <-timer.C:
+			t.Fatalf("only %d/%d packets delivered", i, total)
+		}
+	}
 }

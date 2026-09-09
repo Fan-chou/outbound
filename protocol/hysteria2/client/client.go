@@ -560,3 +560,10 @@ func (io *udpIOImpl) SendMessage(ctx context.Context, buf []byte, msg *protocol.
 	}
 	return io.Conn.SendDatagramContext(ctx, buf[:msgN])
 }
+
+func (io *udpIOImpl) DatagramSendQueueLen() int {
+	if conn, ok := io.Conn.(interface{ DatagramSendQueueLen() int }); ok {
+		return conn.DatagramSendQueueLen()
+	}
+	return -1
+}

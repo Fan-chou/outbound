@@ -85,8 +85,16 @@ func TestUDPConnWriteToSerializesSendFunc(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 
+	waiters, held, pending := u.UDPWriteState()
+	if waiters != 1 || !held || pending != -1 {
+		t.Errorf("blocked write state = (%d,%v,%d)", waiters, held, pending)
+	}
 	close(releaseFirst)
 	wg.Wait()
+	waiters, held, _ = u.UDPWriteState()
+	if waiters != 0 || held {
+		t.Errorf("write state not cleared: %d %v", waiters, held)
+	}
 
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("unexpected SendFunc call count: got %d want 2", got)

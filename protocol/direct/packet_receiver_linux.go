@@ -5,8 +5,12 @@ package direct
 import (
 	"fmt"
 	"net/netip"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
@@ -21,16 +25,19 @@ const (
 	// buffers and the first jumbo datagram is preserved.
 	directPacketReceiverSmallBufferSize = 8192
 	directPacketReceiverBatchSize       = 64
+	directPacketReceiverYieldBudget     = 32
 )
 
 // packetReceiverRegistry multiplexes direct UDP sockets through one Linux
 // epoll reader. The socket itself remains owned by its logical PacketConn;
 // only packet readiness and delivery are shared.
 type packetReceiverRegistry struct {
-	mu      sync.RWMutex
-	started bool
-	epollFD int
-	entries map[int]*directPacketReceiverEntry
+	mu                 sync.RWMutex
+	started            bool
+	epollFD            int
+	entries            map[int]*directPacketReceiverEntry
+	pollFile           *os.File
+	receivedSinceYield int // owned by the receive loop, across descriptors and epoll batches
 }
 
 type directPacketReceiverEntry struct {
@@ -137,17 +144,49 @@ func (r *packetReceiverRegistry) ensureStartedLocked() bool {
 	if err != nil {
 		return false
 	}
+	// Let Go netpoll wait for epoll readiness. A blocking raw EpollWait
+	// can retain a P in syscall until sysmon retakes it, delaying consumers
+	// after a fairness yield. The epoll descriptor is itself pollable.
+	if err := unix.SetNonblock(epollFD, true); err != nil {
+		_ = unix.Close(epollFD)
+		return false
+	}
+	file := os.NewFile(uintptr(epollFD), "direct-udp-epoll")
+	// If runtime poll registration failed, retain the ordinary per-socket fallback.
+	if err := file.SetReadDeadline(time.Time{}); err != nil {
+		_ = file.Close()
+		return false
+	}
+	raw, err := file.SyscallConn()
+	if err != nil {
+		_ = file.Close()
+		return false
+	}
+	r.pollFile = file
 	r.started = true
 	r.epollFD = epollFD
 	r.entries = make(map[int]*directPacketReceiverEntry)
-	go r.loop(epollFD)
+	go r.loop(raw)
 	return true
 }
 
-func (r *packetReceiverRegistry) loop(epollFD int) {
+func (r *packetReceiverRegistry) loop(raw syscall.RawConn) {
 	events := make([]unix.EpollEvent, 64)
 	for {
-		n, err := unix.EpollWait(epollFD, events, -1)
+		var n int
+		var waitErr error
+		err := raw.Read(func(fd uintptr) bool {
+			for {
+				n, waitErr = unix.EpollWait(int(fd), events, 0)
+				if waitErr == unix.EINTR {
+					continue
+				}
+				return n > 0 || waitErr != nil
+			}
+		})
+		if err == nil {
+			err = waitErr
+		}
 		if err == unix.EINTR {
 			continue
 		}
@@ -215,6 +254,11 @@ func (r *packetReceiverRegistry) drain(entry *directPacketReceiverEntry) {
 		})
 		if !entry.active.Load() || !entry.handler(packet) {
 			packet.Release()
+		}
+		r.receivedSinceYield++
+		if r.receivedSinceYield >= directPacketReceiverYieldBudget {
+			r.receivedSinceYield = 0
+			runtime.Gosched()
 		}
 	}
 }

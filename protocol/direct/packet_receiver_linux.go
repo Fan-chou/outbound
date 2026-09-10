@@ -41,9 +41,16 @@ type packetReceiverRegistry struct {
 }
 
 type directPacketReceiverEntry struct {
-	fd      int
-	handler netproxy.PacketReceiveHandler
-	active  atomic.Bool
+	fd              int
+	raw             syscall.RawConn
+	receiveCallback func(uintptr)
+	receiveBuffer   []byte
+	receiveN        int
+	receiveFrom     unix.Sockaddr
+	receiveErr      error
+	receivePeek     [1]byte
+	handler         netproxy.PacketReceiveHandler
+	active          atomic.Bool
 }
 
 var defaultPacketReceiverRegistry = &packetReceiverRegistry{}
@@ -106,6 +113,11 @@ func (r *packetReceiverRegistry) register(conn *directPacketConn, entry *directP
 	if _, exists := r.entries[fd]; exists {
 		return false
 	}
+	entry.raw, err = conn.SyscallConn()
+	if err != nil {
+		return false
+	}
+	entry.receiveCallback = entry.receiveProtected
 	entry.fd = fd
 	entry.active.Store(true)
 	r.entries[fd] = entry
@@ -210,33 +222,15 @@ func (r *packetReceiverRegistry) drain(entry *directPacketReceiverEntry) {
 		if !entry.active.Load() {
 			return
 		}
-		var peek [1]byte
-		packetLen, _, err := unix.Recvfrom(entry.fd, peek[:], unix.MSG_DONTWAIT|unix.MSG_PEEK|unix.MSG_TRUNC)
+		buf, n, sockaddr, err := entry.receive()
 		if err != nil {
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
-				if err == unix.EINTR {
-					continue
-				}
-				return
+			if buf != nil {
+				pool.Put(buf)
 			}
-			r.deliverError(entry, err)
-			return
-		}
-		bufSize := directPacketReceiverSmallBufferSize
-		if packetLen > bufSize {
-			bufSize = packetLen
-			if bufSize > directPacketReceiverBufferSize {
-				bufSize = directPacketReceiverBufferSize
+			if err == unix.EINTR {
+				continue
 			}
-		}
-		buf := pool.GetFullCap(bufSize)
-		n, sockaddr, err := unix.Recvfrom(entry.fd, buf, unix.MSG_DONTWAIT)
-		if err != nil {
-			pool.Put(buf)
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK || err == unix.EINTR {
-				if err == unix.EINTR {
-					continue
-				}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
 			}
 			r.deliverError(entry, err)
@@ -308,4 +302,34 @@ func directPacketReceiverAddrPort(sockaddr unix.Sockaddr) (netip.AddrPort, bool)
 	default:
 		return netip.AddrPort{}, false
 	}
+}
+
+// receive keeps the original socket alive across the nonblocking peek and recv.
+// State is owned exclusively by the shared receive loop; delivery must occur
+// after Control returns so handlers can close the socket without deadlocking.
+// The cached callback avoids per-packet escaping closure allocations.
+func (entry *directPacketReceiverEntry) receive() ([]byte, int, unix.Sockaddr, error) {
+	controlErr := entry.raw.Control(entry.receiveCallback)
+	buf, n, from, err := entry.receiveBuffer, entry.receiveN, entry.receiveFrom, entry.receiveErr
+	entry.receiveBuffer, entry.receiveN, entry.receiveFrom, entry.receiveErr = nil, 0, nil, nil
+	if controlErr != nil {
+		err = controlErr
+	}
+	return buf, n, from, err
+}
+
+func (entry *directPacketReceiverEntry) receiveProtected(fd uintptr) {
+	size, _, err := unix.Recvfrom(int(fd), entry.receivePeek[:], unix.MSG_DONTWAIT|unix.MSG_PEEK|unix.MSG_TRUNC)
+	if err != nil {
+		entry.receiveErr = err
+		return
+	}
+	if size < directPacketReceiverSmallBufferSize {
+		size = directPacketReceiverSmallBufferSize
+	}
+	if size > directPacketReceiverBufferSize {
+		size = directPacketReceiverBufferSize
+	}
+	entry.receiveBuffer = pool.GetFullCap(size)
+	entry.receiveN, entry.receiveFrom, entry.receiveErr = unix.Recvfrom(int(fd), entry.receiveBuffer, unix.MSG_DONTWAIT)
 }

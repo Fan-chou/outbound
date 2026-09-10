@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -111,11 +112,17 @@ func newUnixDatagramReceiverEntry(t *testing.T) (*directPacketReceiverEntry, int
 	if err != nil {
 		t.Fatalf("Socketpair: %v", err)
 	}
-	entry := &directPacketReceiverEntry{fd: fds[0]}
+	file := os.NewFile(uintptr(fds[0]), "test-dgram")
+	raw, err := file.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &directPacketReceiverEntry{fd: fds[0], raw: raw}
+	entry.receiveCallback = entry.receiveProtected
 	entry.active.Store(true)
 	return entry, fds[1], func() {
 		entry.active.Store(false)
-		_ = unix.Close(fds[0])
+		_ = file.Close()
 		_ = unix.Close(fds[1])
 	}
 }

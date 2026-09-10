@@ -565,7 +565,16 @@ func (b *bbrSender) getTargetCongestionWindow(gain float64) congestion.ByteCount
 
 // The target congestion window during PROBE_RTT.
 func (b *bbrSender) probeRttCongestionWindow() congestion.ByteCount {
-	return b.minCongestionWindow
+	// Drain to half of the measured BDP, retaining the minimum window for
+	// small or unmeasured paths. A fixed four-packet window can stall a
+	// high-RTT UDP relay's feedback for multiple rounds, overflowing both
+	// its DATAGRAM and ingress queues even on a lossless path. The reduced
+	// BDP target still drains the path without disabling RTT probing.
+	if b.bandwidthEstimate() == 0 || b.minRtt == 0 {
+		return b.minCongestionWindow
+	}
+	target := bdpFromRttAndBandwidth(b.minRtt, b.bandwidthEstimate()) / 2
+	return max(b.minCongestionWindow, min(target, b.congestionWindow))
 }
 
 func (b *bbrSender) maybeUpdateMinRtt(now time.Time, sampleMinRtt time.Duration) bool {

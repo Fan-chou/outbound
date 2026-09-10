@@ -497,8 +497,8 @@ func TestDefraggerTTLAndResourceLimits(t *testing.T) {
 	if got := ids.Feed(track(fragmentMessage(1, 21, 0, 2, "bb"))); got != nil {
 		t.Fatalf("packet beyond ID cap = %v, want nil", got)
 	}
-	if got := ids.Feed(track(fragmentMessage(1, 20, 1, 2, "cc"))); got == nil {
-		t.Fatal("packet at ID cap did not complete")
+	if got := ids.Feed(track(fragmentMessage(1, 21, 1, 2, "cc"))); got == nil {
+		t.Fatal("newest packet at ID cap did not complete")
 	}
 	if capped.Load() != 3 {
 		t.Fatalf("ID cap release count = %d, want 3", capped.Load())
@@ -515,7 +515,7 @@ func TestDefraggerTTLAndResourceLimits(t *testing.T) {
 	if got := memory.Feed(trackWithCounter(fragmentMessage(1, 31, 0, 2, "cd"), &bounded)); got != nil {
 		t.Fatalf("packet beyond memory cap = %v, want nil", got)
 	}
-	if got := memory.Feed(trackWithCounter(fragmentMessage(1, 30, 1, 2, "cd"), &bounded)); got != nil {
+	if got := memory.Feed(trackWithCounter(fragmentMessage(1, 31, 1, 2, "cd"), &bounded)); got != nil {
 		t.Fatalf("oversized completion = %v, want nil", got)
 	}
 	memory.Close()

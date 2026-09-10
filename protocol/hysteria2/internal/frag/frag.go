@@ -65,7 +65,7 @@ const (
 	DefaultFragmentTTL = 5 * time.Second
 	// DefaultMaxPacketIDs bounds the number of interleaved packets retained by
 	// one UDP session.
-	DefaultMaxPacketIDs = 64
+	DefaultMaxPacketIDs = 256
 	// DefaultMaxPacketSize bounds the reassembled payload size. It is larger
 	// than the local 4 KiB send buffer so it does not reject valid UDP payloads
 	// from peers that use a larger datagram limit.
@@ -169,6 +169,7 @@ func (d *Defragger) Feed(m *protocol.UDPMessage) *protocol.UDPMessage {
 		return nil
 	}
 	if len(m.Data) > d.config.MaxPacketSize {
+		reassemblyRejected.Add(1)
 		releaseMessage(m)
 		return nil
 	}
@@ -178,12 +179,29 @@ func (d *Defragger) Feed(m *protocol.UDPMessage) *protocol.UDPMessage {
 
 	state, ok := d.packets[m.PacketID]
 	if !ok {
-		// Reject rather than evicting an in-flight packet. This prevents a
-		// peer from keeping the session permanently busy by rotating IDs and
-		// makes the resource ceiling deterministic.
-		if len(d.packets) >= d.config.MaxPacketIDs || !d.fitsMemory(len(m.Data)) {
+		// Missing fragments must not reserve every slot until their TTL:
+		// under ordinary packet loss that would reject complete newer traffic.
+		// Keep the same resource bounds and prefer the oldest incomplete packet.
+		if len(m.Data) > d.config.MaxMemoryBytes {
+			reassemblyRejected.Add(1)
 			releaseMessage(m)
 			return nil
+		}
+		for len(d.packets) >= d.config.MaxPacketIDs || !d.fitsMemory(len(m.Data)) {
+			var oldest *fragmentState
+			var oldestID uint16
+			for id, candidate := range d.packets {
+				if oldest == nil || candidate.deadline.Before(oldest.deadline) {
+					oldest, oldestID = candidate, id
+				}
+			}
+			if oldest == nil {
+				reassemblyRejected.Add(1)
+				releaseMessage(m)
+				return nil
+			}
+			d.dropStateLocked(oldestID, oldest)
+			reassemblyEvicted.Add(1)
 		}
 		state = &fragmentState{
 			fragCount: m.FragCount,
@@ -210,11 +228,13 @@ func (d *Defragger) Feed(m *protocol.UDPMessage) *protocol.UDPMessage {
 			return nil
 		}
 		if state.size > d.config.MaxPacketSize-len(m.Data) {
+			reassemblyRejected.Add(1)
 			d.dropStateLocked(m.PacketID, state)
 			releaseMessage(m)
 			return nil
 		}
 		if !d.fitsMemory(len(m.Data)) {
+			reassemblyRejected.Add(1)
 			releaseMessage(m)
 			return nil
 		}
@@ -245,6 +265,7 @@ func (d *Defragger) Feed(m *protocol.UDPMessage) *protocol.UDPMessage {
 	m.FragID = 0
 	m.FragCount = 1
 	m.Release = nil
+	reassemblyCompleted.Add(1)
 	return m
 }
 
@@ -259,6 +280,7 @@ func (d *Defragger) expireLocked(now time.Time) {
 			continue
 		}
 		d.dropStateLocked(packetID, state)
+		reassemblyExpired.Add(1)
 	}
 }
 

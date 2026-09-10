@@ -42,8 +42,8 @@ func TestProbeRTTWindowBounds(t *testing.T) {
 		rate         uint64
 		window, want congestion.ByteCount
 	}{
-		{"unmeasured", 0, 80000, 4800},
-		{"small path", 1000, 80000, 4800},
+		{"unmeasured", 0, 80000, defaultMinimumCongestionWindow},
+		{"small path", 1000, 80000, defaultMinimumCongestionWindow},
 		{"existing window", 250000, 10000, 10000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

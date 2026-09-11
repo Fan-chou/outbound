@@ -184,7 +184,8 @@ type bbrSender struct {
 
 	// Indicates whether the most recent bandwidth sample was marked as
 	// app-limited.
-	lastSampleIsAppLimited bool
+	lastSampleIsAppLimited     bool
+	explicitApplicationLimited bool
 	// Indicates whether any non app-limited samples have been recorded.
 	hasNoAppLimitedSample bool
 
@@ -407,7 +408,9 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	// packet in lost_packets.
 	var lastPacketSendState sendTimeState
 
-	b.maybeApplimited(priorInFlight)
+	if !b.explicitApplicationLimited {
+		b.maybeApplimited(priorInFlight)
+	}
 
 	// Update bytesInFlight
 	b.bytesInFlight = priorInFlight
@@ -682,6 +685,15 @@ func (b *bbrSender) checkIfFullBandwidthReached(lastPacketSendState *sendTimeSta
 	if b.roundsWithoutBandwidthGain >= b.numStartupRtts ||
 		b.shouldExitStartupDueToLoss(lastPacketSendState) {
 		b.isAtFullBandwidth = true
+	}
+}
+
+// SetApplicationLimited enables send-loop reporting. Keep the heuristic only
+// for older transports that don't provide explicit supply notifications.
+func (b *bbrSender) SetApplicationLimited(limited bool) {
+	b.explicitApplicationLimited = true
+	if limited {
+		b.sampler.OnAppLimited()
 	}
 }
 

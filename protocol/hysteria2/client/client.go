@@ -567,3 +567,10 @@ func (io *udpIOImpl) DatagramSendQueueLen() int {
 	}
 	return -1
 }
+
+func (io *udpIOImpl) DatagramSendObservation() (uint64, string) {
+	if conn, ok := io.Conn.(interface{ DatagramSendObservation() (uint64, string) }); ok {
+		return conn.DatagramSendObservation()
+	}
+	return 0, ""
+}

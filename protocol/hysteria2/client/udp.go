@@ -61,11 +61,12 @@ type udpConn struct {
 	// to detect transport death without waiting for ReadFrom/WriteTo errors.
 	transportDone <-chan struct{}
 
-	writeWaiters     atomic.Int32
-	writeLocked      atomic.Bool
-	pendingDatagrams func() int // immutable after session creation
-	writeMu          sync.Mutex
-	receiveMu        sync.Mutex
+	writeWaiters         atomic.Int32
+	writeLocked          atomic.Bool
+	transportObservation func() (uint64, string)
+	pendingDatagrams     func() int // immutable after session creation
+	writeMu              sync.Mutex
+	receiveMu            sync.Mutex
 	// deliverMu serializes RegisterPacketReceiver's drain against feed's
 	// deliver/queue path so queued datagrams stay FIFO with live ones.
 	deliverMu     sync.Mutex
@@ -578,6 +579,9 @@ func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netp
 	if observer, ok := m.io.(interface{ DatagramSendQueueLen() int }); ok {
 		conn.pendingDatagrams = observer.DatagramSendQueueLen
 	}
+	if observer, ok := m.io.(interface{ DatagramSendObservation() (uint64, string) }); ok {
+		conn.transportObservation = observer.DatagramSendObservation
+	}
 	conn.CloseFunc = func() {
 		m.close(conn)
 	}
@@ -667,4 +671,11 @@ func (u *udpConn) UDPWriteState() (lockWaiters int32, lockHeld bool, pendingData
 		pendingDatagrams = u.pendingDatagrams()
 	}
 	return u.writeWaiters.Load(), u.writeLocked.Load(), pendingDatagrams
+}
+
+func (u *udpConn) UDPTransportObservation() (uint64, string) {
+	if u.transportObservation != nil {
+		return u.transportObservation()
+	}
+	return 0, ""
 }

@@ -300,3 +300,26 @@ func TestDirectPacketReceiverBurstAllowsConsumer(t *testing.T) {
 		}
 	}
 }
+
+func TestDirectPacketReceiverFailureRetiresRegistry(t *testing.T) {
+	r := &packetReceiverRegistry{started: true, epollFD: -1, entries: make(map[int]*directPacketReceiverEntry)}
+	entry := &directPacketReceiverEntry{fd: 123}
+	called := false
+	entry.handler = func(packet *netproxy.ReceivedPacket) bool {
+		called = true
+		r.unregister(entry) // Must not deadlock with fatal-loop cleanup.
+		packet.Release()
+		return true
+	}
+	entry.active.Store(true)
+	r.entries[entry.fd] = entry
+	r.fail(unix.EIO)
+	if !called || entry.active.Load() {
+		t.Fatal("existing receiver was not notified and retired")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ensureStartedLocked() {
+		t.Fatal("failed registry accepted another receiver")
+	}
+}

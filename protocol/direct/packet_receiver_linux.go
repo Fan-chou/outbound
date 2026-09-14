@@ -203,6 +203,7 @@ func (r *packetReceiverRegistry) loop(raw syscall.RawConn) {
 			continue
 		}
 		if err != nil {
+			r.fail(err)
 			return
 		}
 		for i := 0; i < n; i++ {
@@ -214,6 +215,27 @@ func (r *packetReceiverRegistry) loop(raw syscall.RawConn) {
 				r.drain(entry)
 			}
 		}
+	}
+}
+
+// fail retires a broken receiver permanently. New sockets use the ordinary
+// blocking reader; existing sockets receive an error so their owners can close
+// and recreate them instead of waiting forever for a loop that has exited.
+func (r *packetReceiverRegistry) fail(err error) {
+	r.mu.Lock()
+	entries, file := r.entries, r.pollFile
+	r.entries = nil
+	r.pollFile = nil
+	r.started = true
+	r.epollFD = -1
+	r.mu.Unlock()
+	if file != nil {
+		_ = file.Close()
+	}
+	// A handler may unregister itself; never call it with the registry locked.
+	for _, entry := range entries {
+		r.deliverError(entry, fmt.Errorf("direct UDP receiver stopped: %w", err))
+		entry.active.Store(false)
 	}
 }
 

@@ -6,6 +6,8 @@ github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185 h1:sX+DiAluUPnZbf
 github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Fan-chou/quic-go v0.0.0-20260909151702-8fd15d6d9062 h1:3jfLJF5j2KUYHTS594llhzM6m752HACue8r2laU4kMA=
 github.com/Fan-chou/quic-go v0.0.0-20260909151702-8fd15d6d9062/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
+github.com/Fan-chou/quic-go v0.0.0-20260914142134-5032a165a58c h1:jf0FNnTzYeQEgzUE9usVgQHgCj5Fou7rTr2sdn/Zw/U=
+github.com/Fan-chou/quic-go v0.0.0-20260914142134-5032a165a58c/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/andybalholm/brotli v1.0.6 h1:Yf9fFpf49Zrxb9NlQaluyE92/+X7UVHlhMNJN2sxfOI=
 github.com/andybalholm/brotli v1.0.6/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
 github.com/awnumar/fastrand v0.0.0-20210315215012-30ee0990fa2d h1:NkqtWyrOjr0QK1FSCmXS6Whbwh100Qt74SaRn92PemU=

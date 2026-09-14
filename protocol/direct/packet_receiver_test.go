@@ -232,7 +232,26 @@ func TestDirectPacketReceiverBurstAllowsConsumer(t *testing.T) {
 	if err := client.SetReadBuffer(1 << 20); err != nil {
 		t.Fatal(err)
 	}
-	const total = 512
+	raw, err := client.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receiveBuffer int
+	var sockErr error
+	if err = raw.Control(func(fd uintptr) {
+		receiveBuffer, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if sockErr != nil {
+		t.Fatal(sockErr)
+	}
+	// Small datagrams still consume skb memory. Keep the preloaded burst
+	// within the actual socket budget while exercising multiple drain batches.
+	total := min(512, receiveBuffer/2048)
+	if total <= directPacketReceiverBatchSize {
+		t.Skip("receive buffer too small for a multi-batch burst")
+	}
 	for i := 0; i < total; i++ {
 		b := make([]byte, 38)
 		binary.BigEndian.PutUint32(b, uint32(i))

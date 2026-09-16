@@ -72,7 +72,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		if magicNetwork.Network == "tcp" {
 			return tcpConn, nil
 		} else {
-			return &PacketConn{Conn: tcpConn}, nil
+			return &PacketConn{Conn: tcpConn, domainResolver: protocol.DomainResolver{Resolve: protocol.DatapathResolverFromContext(ctx)}}, nil
 		}
 
 	default:

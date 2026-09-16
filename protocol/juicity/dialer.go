@@ -165,7 +165,8 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			return conn, nil
 		} else {
 			return &PacketConn{
-				Conn: conn,
+				Conn:           conn,
+				domainResolver: protocol.DomainResolver{Resolve: protocol.DatapathResolverFromContext(ctx)},
 			}, nil
 		}
 

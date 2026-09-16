@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -89,7 +90,6 @@ type ClientConn struct {
 	closer    context.CancelFunc
 	muReading sync.Mutex // muReading protects reading
 	muWriting sync.Mutex // muWriting protects writing
-	muSend    sync.Mutex // muSend serializes stream sends
 	buf       []byte
 	offset    int
 
@@ -99,6 +99,9 @@ type ClientConn struct {
 	recvCh   chan RecvResp
 	pumpOnce sync.Once
 	recvErr  error
+
+	sendCh     chan *sendRequest
+	senderOnce sync.Once
 
 	deadlineMu    sync.Mutex
 	readDeadline  *time.Timer
@@ -148,12 +151,55 @@ func (c *ClientConn) ensureRecvPump() {
 	})
 }
 
+// Each request has two owners after handoff: Write and the sender. Publishing
+// the result does not release the writer's ownership. In particular, another
+// connection must never recycle a request before its result has been consumed.
+type sendRequest struct {
+	hunk proto.Hunk
+	done chan error
+	refs atomic.Int32
+}
+
+var sendReqPool = sync.Pool{New: func() any {
+	return &sendRequest{done: make(chan error, 1)}
+}}
+
+func (r *sendRequest) release() {
+	if r.refs.Add(-1) != 0 {
+		return
+	}
+	// Keep ordinary chunks reusable without retaining oversized caller writes.
+	data := r.hunk.Data[:0]
+	if cap(data) > 64*1024 {
+		data = nil
+	}
+	r.hunk = proto.Hunk{Data: data}
+	sendReqPool.Put(r)
+}
+
+func (c *ClientConn) ensureSender() {
+	c.senderOnce.Do(func() {
+		go func() {
+			for {
+				select {
+				case req := <-c.sendCh:
+					req.done <- c.tun.Send(&req.hunk)
+					req.release()
+				case <-c.ctx.Done():
+					return
+				}
+			}
+		}()
+	})
+}
+
 func NewClientConn(tun proto.GunService_TunClient, closer context.CancelFunc) *ClientConn {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctxRead, cancelRead := context.WithCancel(context.Background())
 	ctxWrite, cancelWrite := context.WithCancel(context.Background())
 	return &ClientConn{
 		tun:         tun,
+		sendCh:      make(chan *sendRequest),
 		closer:      closer,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -242,15 +288,28 @@ func (c *ClientConn) Write(p []byte) (n int, err error) {
 	// Refresh after acquiring the write lock so deadline changes made while
 	// this operation waited for another writer apply to the pending I/O.
 	ctxWrite = c.writeCtx()
-	// set 1 to avoid channel leak
-	sendDone := make(chan error, 1)
-	// pass channel to the function to avoid closure leak
-	go func(sendDone chan error) {
-		c.muSend.Lock()
-		defer c.muSend.Unlock()
-		e := c.tun.Send(&proto.Hunk{Data: p})
-		sendDone <- e
-	}(sendDone)
+	c.ensureSender()
+	req := sendReqPool.Get().(*sendRequest)
+	req.refs.Store(2)
+	defer req.release()
+	select {
+	case <-req.done:
+	default:
+	}
+	// A cancelled Write may return before grpc Send finishes. Own the payload
+	// until that Send returns, so the caller can immediately reuse its buffer.
+	data := append(req.hunk.Data[:0], p...)
+	req.hunk = proto.Hunk{Data: data}
+	select {
+	case c.sendCh <- req:
+	case <-ctxWrite.Done():
+		req.release() // sender never acquired this request
+		c.closer()
+		return 0, os.ErrDeadlineExceeded
+	case <-c.ctx.Done():
+		req.release()
+		return 0, io.EOF
+	}
 	select {
 	case <-ctxWrite.Done():
 		// A wedged gRPC Send cannot be aborted or bypassed, and a second
@@ -262,11 +321,14 @@ func (c *ClientConn) Write(p []byte) (n int, err error) {
 		return 0, os.ErrDeadlineExceeded
 	case <-c.ctx.Done():
 		return 0, io.EOF
-	case err = <-sendDone:
+	case err = <-req.done:
 		if code := status.Code(err); code == codes.Unavailable || status.Code(err) == codes.OutOfRange {
 			err = io.EOF
 		}
-		return len(p), err
+		if err != nil {
+			return 0, err
+		}
+		return len(p), nil
 	}
 }
 

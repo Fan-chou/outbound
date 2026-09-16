@@ -7,7 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"sync"
+	"time"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -17,8 +17,8 @@ import (
 
 type PacketConn struct {
 	*Conn
-	domainIpMapping sync.Map
-	writeTarget     common.LastStringValue[protocol.Metadata]
+	domainResolver protocol.DomainResolver
+	writeTarget    common.LastStringValue[protocol.Metadata]
 }
 
 var parseMetadata = protocol.ParseMetadata
@@ -37,27 +37,31 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addrPort netip.AddrPort, err err
 	if _, err = m.Unpack(c.Conn); err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	if addrPort, err = m.DomainIpMapping(&c.domainIpMapping); err != nil {
-		return 0, netip.AddrPort{}, fmt.Errorf("ReadFrom AddrPort: %w", err)
-	}
 
+	// Consume the whole frame before resolving the reported address: see the
+	// same note in trojanc.PacketConn.ReadFrom. Any failure then leaves the
+	// stream at a frame boundary, so a caller can drop this datagram and keep
+	// the session.
 	var lengthBuf [2]byte
 	if _, err = io.ReadFull(c.Conn, lengthBuf[:]); err != nil {
 		return 0, netip.AddrPort{}, err
 	}
 	length := int(binary.BigEndian.Uint16(lengthBuf[:]))
-	if length <= len(p) {
-		if n, err = io.ReadFull(c.Conn, p[:length]); err != nil {
-			return 0, netip.AddrPort{}, err
-		}
-		return n, addrPort, nil
-	} else {
+	if length > len(p) {
 		if n, err = io.ReadFull(c.Conn, p); err != nil {
 			return 0, netip.AddrPort{}, err
 		}
-		_, _ = io.CopyN(io.Discard, c.Conn, int64(length-len(p)))
-		return n, addrPort, nil
+		if _, err = io.CopyN(io.Discard, c.Conn, int64(length-len(p))); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
+	} else if n, err = io.ReadFull(c.Conn, p[:length]); err != nil {
+		return 0, netip.AddrPort{}, err
 	}
+
+	if addrPort, err = c.domainResolver.Map(&m.Metadata); err != nil {
+		return 0, netip.AddrPort{}, fmt.Errorf("ReadFrom AddrPort: %w", err)
+	}
+	return n, addrPort, nil
 }
 
 func (c *PacketConn) WriteTo(p []byte, addr string) (n int, err error) {
@@ -92,10 +96,6 @@ func (c *PacketConn) metadataForAddr(addr string) (protocol.Metadata, error) {
 	return mdata, nil
 }
 
-func (c *PacketConn) Close() error {
-	return c.Conn.Close()
-}
-
 func (c *PacketConn) TransportDone() <-chan struct{} {
 	if c.Conn == nil {
 		return nil
@@ -114,5 +114,19 @@ func SealUDP(metadata trojanc.Metadata, dst []byte, data []byte) []byte {
 	return dst[:n+2+len(data)]
 }
 
-// The underlying QUIC stream supports independent write deadlines.
-func (c *PacketConn) SupportsIndependentPacketWriteDeadline() bool { return true }
+func (c *PacketConn) Close() error {
+	c.domainResolver.Close()
+	return c.Conn.Close()
+}
+func (c *PacketConn) SetReadDeadline(t time.Time) error {
+	if err := c.domainResolver.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+func (c *PacketConn) SetDeadline(t time.Time) error {
+	if err := c.domainResolver.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.Conn.SetDeadline(t)
+}

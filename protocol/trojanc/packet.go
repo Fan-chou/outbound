@@ -7,7 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"sync"
+	"time"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/protocol"
@@ -15,8 +15,8 @@ import (
 
 type PacketConn struct {
 	*Conn
-	domainIpMapping sync.Map
-	writeTarget     common.LastStringValue[protocol.Metadata]
+	domainResolver protocol.DomainResolver
+	writeTarget    common.LastStringValue[protocol.Metadata]
 }
 
 var parseMetadata = protocol.ParseMetadata
@@ -35,10 +35,13 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) 
 	if _, err = m.Unpack(c.Conn); err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	if addr, err = m.DomainIpMapping(&c.domainIpMapping); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
 
+	// Consume the whole frame before resolving the reported address. Resolving
+	// can fail (a peer-supplied domain that does not resolve in time), and
+	// returning with the body still unread would leave the next Unpack parsing
+	// payload bytes as metadata. Reading first keeps every error at a frame
+	// boundary, which is what lets the caller drop one datagram and keep the
+	// session instead of tearing it down.
 	var lengthAndCRLF [4]byte
 	if _, err = io.ReadFull(c.Conn, lengthAndCRLF[:]); err != nil {
 		return 0, netip.AddrPort{}, err
@@ -47,18 +50,22 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) 
 		return 0, netip.AddrPort{}, fmt.Errorf("invalid trojan UDP CRLF")
 	}
 	length := int(binary.BigEndian.Uint16(lengthAndCRLF[:2]))
-	if length <= len(p) {
-		if n, err = io.ReadFull(c.Conn, p[:length]); err != nil {
+	if length > len(p) {
+		// Caller buffer too small: fill it and discard the remainder of the
+		// datagram so the stream stays framed.
+		if n, err = io.ReadFull(c.Conn, p); err != nil {
 			return 0, netip.AddrPort{}, err
 		}
-		return n, addr, nil
-	}
-	// Caller buffer too small: fill it and discard the remainder of the
-	// datagram so the stream stays framed.
-	if n, err = io.ReadFull(c.Conn, p); err != nil {
+		if _, err = io.CopyN(io.Discard, c.Conn, int64(length-len(p))); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
+	} else if n, err = io.ReadFull(c.Conn, p[:length]); err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	_, _ = io.CopyN(io.Discard, c.Conn, int64(length-len(p)))
+
+	if addr, err = c.domainResolver.Map(&m.Metadata); err != nil {
+		return 0, netip.AddrPort{}, err
+	}
 	return n, addr, nil
 }
 
@@ -101,4 +108,21 @@ func SealUDP(metadata Metadata, dst []byte, data []byte) []byte {
 	binary.BigEndian.PutUint16(dst[n:], uint16(len(data)))
 	copy(dst[n+2:], CRLF)
 	return dst[:n+4+len(data)]
+}
+
+func (c *PacketConn) Close() error {
+	c.domainResolver.Close()
+	return c.Conn.Close()
+}
+func (c *PacketConn) SetReadDeadline(t time.Time) error {
+	if err := c.domainResolver.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+func (c *PacketConn) SetDeadline(t time.Time) error {
+	if err := c.domainResolver.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.Conn.SetDeadline(t)
 }

@@ -83,7 +83,7 @@ func (c *Conn) writeTargetAddrPort(addr string) (*net.UDPAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-	addrPort := target.AddrPort()
+	addrPort := unmapAddrPort(target.AddrPort())
 	c.writeCache.Store(addr, addrPort)
 	return target, nil
 }

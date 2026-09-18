@@ -311,7 +311,7 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 				// logrus.Println("wtf", retry, addr)
 				if retry > 2 {
 					_ = c.Close()
-					return nil, errors.New("nil ecdheKey")
+					return nil, fmt.Errorf("REALITY: fingerprint %s %s does not provide a usable TLS 1.3 key share", x.fingerprint.Client, x.fingerprint.Version)
 				}
 				_ = c.Close() // this attempt's underlay is orphaned by the retry
 				retry++

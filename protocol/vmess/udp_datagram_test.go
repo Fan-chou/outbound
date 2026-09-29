@@ -2,6 +2,7 @@ package vmess
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -80,8 +81,11 @@ func TestReadFromDoesNotSplitLeftoverAsSecondDatagram(t *testing.T) {
 	c.initRead.Do(func() {})
 	first := make([]byte, 4)
 	n, _, err := c.ReadFrom(first)
-	if err != io.ErrShortBuffer {
-		t.Fatalf("first ReadFrom err = %v, want ErrShortBuffer", err)
+	// Both matching styles must hold: the typed datagram-dropped contract and
+	// the legacy io.ErrShortBuffer sentinel it unwraps to.
+	var dropped *netproxy.ErrDatagramDropped
+	if !errors.As(err, &dropped) || !errors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("first ReadFrom err = %v, want datagram-dropped/ErrShortBuffer", err)
 	}
 	if n != 0 {
 		t.Fatalf("truncated datagram delivered: n=%d %q", n, first[:n])

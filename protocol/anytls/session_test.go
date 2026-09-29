@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 )
 
@@ -319,6 +320,11 @@ func TestPacketReadFromDrainsShortBuffer(t *testing.T) {
 
 	if _, _, err := packet.ReadFrom(make([]byte, 2)); !errors.Is(err, io.ErrShortBuffer) {
 		t.Fatalf("short ReadFrom() error = %v, want %v", err, io.ErrShortBuffer)
+	} else {
+		var dropped *netproxy.ErrDatagramDropped
+		if !errors.As(err, &dropped) {
+			t.Fatalf("short ReadFrom() error = %v, want the datagram-dropped contract", err)
+		}
 	}
 	buf := make([]byte, 2)
 	n, _, err := packet.ReadFrom(buf)

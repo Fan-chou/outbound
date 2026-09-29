@@ -361,7 +361,7 @@ func (ps *packetStream) ReadFrom(p []byte) (int, netip.AddrPort, error) {
 		if err := ps.drainLocked(int(length)); err != nil {
 			return 0, addr, err
 		}
-		return 0, addr, io.ErrShortBuffer
+		return 0, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
 	}
 	if err := ps.readFullLocked(p[:length]); err != nil {
 		return 0, addr, err

@@ -484,7 +484,7 @@ func (c *Conn) read(b []byte) (n int, err error) {
 		if c.metadata.Network == "udp" {
 			c.leftToRead = nil
 			c.indexToRead = 0
-			return 0, io.ErrShortBuffer
+			return 0, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		c.indexToRead += n
 		if c.indexToRead >= len(c.leftToRead) {
@@ -501,11 +501,12 @@ func (c *Conn) read(b []byte) (n int, err error) {
 	n = copy(b, chunk)
 	if n < len(chunk) {
 		if c.metadata.Network == "udp" {
-			// Do not deliver a truncated datagram; dae skips io.ErrShortBuffer
-			// without retiring the UDP endpoint.
+			// Do not deliver a truncated datagram; dae treats the
+			// datagram-dropped contract (and its io.ErrShortBuffer cause)
+			// as a per-datagram event without retiring the UDP endpoint.
 			c.leftToRead = nil
 			c.indexToRead = 0
-			return 0, io.ErrShortBuffer
+			return 0, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		c.leftToRead = chunk
 		c.indexToRead = n

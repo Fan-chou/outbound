@@ -3,6 +3,7 @@ package vision
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -52,8 +53,12 @@ func TestReadFromDrainsOversizedPayload(t *testing.T) {
 	vc.reader = &readWrapper{directRead: true, vision: vc}
 	pc := &PacketConn{Conn: vc}
 	n, _, err := pc.ReadFrom(make([]byte, 4))
-	if err == nil {
-		t.Fatal("expected buffer too small")
+	// The drained oversized datagram must surface as the typed
+	// datagram-dropped contract (unwrapping to io.ErrShortBuffer), never as
+	// an untyped error or a session-fatal condition.
+	var dropped *netproxy.ErrDatagramDropped
+	if !errors.As(err, &dropped) || !errors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("ReadFrom err = %v, want datagram-dropped/ErrShortBuffer", err)
 	}
 	if n != 0 {
 		t.Fatalf("n = %d, want 0", n)

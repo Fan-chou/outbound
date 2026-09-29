@@ -59,3 +59,31 @@ func TestWrapperCapabilityParity(t *testing.T) {
 		})
 	}
 }
+
+// hidingParityWrapper embeds only the base Conn interface: exactly the bug
+// class the gate exists for (every optional capability the inner conn carried
+// disappears, and none of it is a compile error).
+type hidingParityWrapper struct{ Conn }
+
+// TestMissingCapabilitiesFlagsHidingWrapper proves the gate can fail: a
+// wrapper that neither forwards capabilities nor implements
+// IntrinsicConnProvider must be flagged.
+func TestMissingCapabilitiesFlagsHidingWrapper(t *testing.T) {
+	inner := paritySentinelConn{Conn: nopParityConn{}}
+	got := MissingCapabilities(hidingParityWrapper{Conn: inner}, inner)
+	if len(got) == 0 {
+		t.Fatal("hiding wrapper was not flagged; the parity gate is vacuous")
+	}
+	for _, want := range []string{"ReadFrom", "WriteTo", "CloseWrite"} {
+		found := false
+		for _, name := range got {
+			if name == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing capabilities %v lack %q", got, want)
+		}
+	}
+}

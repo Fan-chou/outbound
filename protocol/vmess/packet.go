@@ -2,9 +2,11 @@ package vmess
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 )
 
@@ -36,7 +38,9 @@ func (c *Conn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 	payload := n - addrLen
 	copied := copy(p, buf[addrLen:n])
 	if copied < payload {
-		return copied, address, fmt.Errorf("buf size is not enough")
+		// The pooled frame buffer consumed the whole datagram; surface the
+		// drop instead of an untyped error that consumers classify as fatal.
+		return copied, address, netproxy.DatagramDropped(io.ErrShortBuffer)
 	}
 	return copied, address, err
 }

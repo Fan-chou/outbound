@@ -183,7 +183,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 			if err != nil {
 				return 0, err
 			}
-			return 0, fmt.Errorf("buf size is not enough")
+			return 0, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		// Read exactly one framed datagram: a plain c.read(b) here could
 		// return a partial or spanning chunk of the UDP-over-TCP stream.

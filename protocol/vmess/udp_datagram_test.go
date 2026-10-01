@@ -2,7 +2,10 @@ package vmess
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -160,4 +163,50 @@ func (identityAEAD) Open(dst, nonce, ciphertext, additionalData []byte) ([]byte,
 	copy(out, dst)
 	copy(out[len(dst):], ciphertext)
 	return out, nil
+}
+
+// TestWritePacketRejectsDatagramBeyondChunkLengthField pins the write-side
+// mirror of the read-side datagram contract: the two-byte chunk length field
+// covers payload + AEAD overhead + padding, so a datagram that would wrap the
+// uint16 must fail the write instead of emitting a bogus frame length that
+// desyncs the stream.
+func TestWritePacketRejectsDatagramBeyondChunkLengthField(t *testing.T) {
+	block, err := aes.NewCipher(make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shake := NewShakeSizeParser(make([]byte, 16))
+	newWriteTestConn := func() *Conn {
+		return &Conn{
+			Conn:                  &bufferConn{Buffer: bytes.NewBuffer(nil)},
+			writeBodyCipher:       aead,
+			writeNonceGenerator:   GenerateChunkNonce(make([]byte, aead.NonceSize()), uint32(aead.NonceSize())),
+			writeChunkSizeParser:  shake,
+			writePaddingGenerator: shake,
+		}
+	}
+
+	// One byte past the field's reach: len(b)+overhead+maxPadding = 0x10000.
+	oversize := make([]byte, 0xFFFF-aead.Overhead()-int(shake.MaxPaddingLen())+1)
+	_, err = newWriteTestConn().writePacket(oversize, nil)
+	if err == nil {
+		t.Fatal("expected the oversize datagram to be rejected before framing")
+	}
+	if got := fmt.Sprint(err); !bytes.Contains([]byte(got), []byte("16-bit chunk length")) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Exactly at the field's reach still frames and writes.
+	fit := make([]byte, 0xFFFF-aead.Overhead()-int(shake.MaxPaddingLen()))
+	n, err := newWriteTestConn().writePacket(fit, nil)
+	if err != nil {
+		t.Fatalf("boundary datagram should write: %v", err)
+	}
+	if n != len(fit) {
+		t.Fatalf("n = %d, want %d", n, len(fit))
+	}
 }

@@ -200,6 +200,15 @@ func (c *Conn) writeStream(b []byte, preWrite []byte) (n int, err error) {
 }
 
 func (c *Conn) writePacket(b []byte, preWrite []byte) (n int, err error) {
+	// The two-byte chunk length field written in sealFromPool covers
+	// len(b) + AEAD overhead + padding. A near-limit datagram (a jumbo one,
+	// or a smaller one whose packetaddr prefix is already counted into b)
+	// would wrap the uint16 and emit a bogus frame length that desyncs the
+	// stream instead of failing the write; reject it up front, mirroring the
+	// mux path's guard for the same field.
+	if int64(len(b))+int64(c.writeBodyCipher.Overhead())+int64(c.writePaddingGenerator.MaxPaddingLen()) > 0xFFFF {
+		return 0, fmt.Errorf("vmess: udp datagram of %d bytes exceeds the 16-bit chunk length field", len(b))
+	}
 	data := c.sealFromPool(b)
 	if preWrite != nil {
 		if _, err = iout.MultiWrite(c.Conn, preWrite, data); err != nil {

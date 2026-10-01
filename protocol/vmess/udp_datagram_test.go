@@ -24,9 +24,10 @@ func (c *bufferConn) SetWriteDeadline(time.Time) error { return nil }
 
 var _ netproxy.Conn = (*bufferConn)(nil)
 
-func TestReadFromClampsPacketAddrPayload(t *testing.T) {
-	payload := []byte("0123456789")
-	addr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("203.0.113.10:53"))
+// framePacketAddrDatagram builds the wire chunk for one packetaddr datagram: a
+// two-byte big-endian size followed by the packet address and its payload.
+func framePacketAddrDatagram(t *testing.T, addr *net.UDPAddr, payload []byte) ([]byte, netip.AddrPort) {
+	t.Helper()
 	addrLen := UDPAddrToPacketAddrLength(addr)
 	buf := make([]byte, addrLen+len(payload))
 	if err := PutPacketAddr(buf, addr); err != nil {
@@ -37,7 +38,12 @@ func TestReadFromClampsPacketAddrPayload(t *testing.T) {
 	framed[0] = byte(len(buf) >> 8)
 	framed[1] = byte(len(buf))
 	copy(framed[2:], buf)
+	return framed, addr.AddrPort()
+}
 
+// newDirectReadPacketAddrConn wires a Conn whose next read returns framed with
+// the identity cipher, so a test can drive ReadFrom without a real peer.
+func newDirectReadPacketAddrConn(framed []byte) *Conn {
 	c := &Conn{
 		Conn: &bufferConn{Buffer: bytes.NewBuffer(framed)},
 		metadata: Metadata{
@@ -52,16 +58,55 @@ func TestReadFromClampsPacketAddrPayload(t *testing.T) {
 	c.readPaddingGenerator = PlainPaddingGenerator{}
 	c.readNonceGenerator = func() []byte { return make([]byte, 12) }
 	c.readBodyCipher = identityAEAD{}
+	return c
+}
+
+// TestReadFromDropsDatagramWhenCallerBufferTooSmall pins the datagram-dropped
+// contract on the packetaddr path: a caller buffer that cannot hold the whole
+// datagram must not receive a truncated payload, and the typed short-buffer
+// error must survive for consumers that classify it.
+func TestReadFromDropsDatagramWhenCallerBufferTooSmall(t *testing.T) {
+	addr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("203.0.113.10:53"))
+	framed, _ := framePacketAddrDatagram(t, addr, []byte("0123456789"))
+	c := newDirectReadPacketAddrConn(framed)
+
 	small := make([]byte, 4)
-	n, gotAddr, err := c.ReadFrom(small)
-	if err == nil {
-		t.Fatal("expected buf size error")
+	n, _, err := c.ReadFrom(small)
+	var dropped *netproxy.ErrDatagramDropped
+	if !errors.As(err, &dropped) || !errors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("ReadFrom err = %v, want datagram-dropped/ErrShortBuffer", err)
 	}
-	if n != 4 {
-		t.Fatalf("n = %d, want 4", n)
+	if n != 0 {
+		t.Fatalf("n = %d, want 0: a truncated datagram must not be delivered", n)
 	}
-	if gotAddr.String() != "203.0.113.10:53" {
-		t.Fatalf("addr = %v", gotAddr)
+}
+
+// TestReadFromDeliversDatagramLargerThanMaxUDPSize is the regression for the
+// packetaddr path staging every datagram through a pooled MaxUDPSize (2048)
+// frame buffer: any datagram larger than that was drained and reported as
+// dropped even when the caller's buffer could hold it, which broke EDNS0-sized
+// DNS replies over VMess.
+func TestReadFromDeliversDatagramLargerThanMaxUDPSize(t *testing.T) {
+	addr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("203.0.113.10:53"))
+	for _, payloadLen := range []int{2048, 2049, 4096} {
+		payload := bytes.Repeat([]byte{0xAB}, payloadLen)
+		framed, wantAddr := framePacketAddrDatagram(t, addr, payload)
+		c := newDirectReadPacketAddrConn(framed)
+
+		out := make([]byte, 65536)
+		n, gotAddr, err := c.ReadFrom(out)
+		if err != nil {
+			t.Fatalf("payload %d: ReadFrom = %v, want the datagram to be delivered", payloadLen, err)
+		}
+		if n != len(payload) {
+			t.Fatalf("payload %d: n = %d, want %d", payloadLen, n, len(payload))
+		}
+		if !bytes.Equal(out[:n], payload) {
+			t.Fatalf("payload %d: delivered bytes differ from the payload", payloadLen)
+		}
+		if gotAddr != wantAddr {
+			t.Fatalf("payload %d: addr = %v, want %v", payloadLen, gotAddr, wantAddr)
+		}
 	}
 }
 

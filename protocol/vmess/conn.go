@@ -22,7 +22,11 @@ var resolveUDPAddr = net.ResolveUDPAddr
 
 const (
 	MaxChunkSize = 1 << 14
-	MaxUDPSize   = 1 << 11
+	// MaxUDPSize is retained for API compatibility. It is NOT a read-path cap:
+	// staging UDP reads through a buffer of this size silently dropped every
+	// datagram larger than 2048 bytes regardless of the caller's capacity.
+	// ReadFrom now reads into the caller's buffer instead.
+	MaxUDPSize = 1 << 11
 
 	maxReusableSealFrameSize = 128 << 10
 )

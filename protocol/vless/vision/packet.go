@@ -104,7 +104,11 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) 
 		}
 		length := binary.BigEndian.Uint16(lengthBytes[:])
 
-		if length > uint16(len(p)) {
+		// Compare in int: casting len(p) to uint16 wraps any buffer of
+		// 65536 bytes (dae's full-range DNS forward buffer, and the pool's
+		// largest bucket) to 0, which would classify every datagram as
+		// oversized and drop the whole UDP path of the connection.
+		if int(length) > len(p) {
 			if _, discardErr := io.CopyN(io.Discard, c.Conn, int64(length)); discardErr != nil {
 				return 0, netip.AddrPort{}, discardErr
 			}

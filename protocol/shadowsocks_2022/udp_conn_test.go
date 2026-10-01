@@ -426,3 +426,57 @@ func TestUdpConn_DecryptCipherCacheDropsToLowWatermarkAfterBurst(t *testing.T) {
 		t.Fatalf("decrypt cipher cache size = %d, want <= %d after burst trimming", got, decryptCipherLowWatermark)
 	}
 }
+
+// TestUdpConn_ReadFromChachaSurfacesOversizeAsDropped pins the typed
+// datagram-dropped contract on the chacha read path: the read buffer carries
+// +320 bytes of headroom, so a wire datagram that decodes to more than the
+// caller's buffer is received and authenticated in full — and must surface as
+// a dropped datagram (session stays usable) instead of a silently truncated
+// successful read.
+func TestUdpConn_ReadFromChachaSurfacesOversizeAsDropped(t *testing.T) {
+	conf := ciphers.Aead2022CiphersConf["2022-blake3-chacha20-poly1305"]
+	if conf == nil {
+		t.Fatal("missing ss2022 chacha cipher config")
+	}
+	psk := make([]byte, conf.KeyLen)
+	for i := range psk {
+		psk[i] = 0x41
+	}
+	core, err := NewSS2022Core(conf, [][]byte{psk}, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localSessionID := [8]byte{1, 3, 5, 7, 9, 11, 13, 15}
+	remoteSessionID := [8]byte{2, 4, 6, 8, 10, 12, 14, 16}
+	wantAddr := netip.MustParseAddrPort("198.51.100.7:443")
+	// 1700 decoded bytes > the 1500-byte caller buffer, while the wire packet
+	// still fits the len(b)+nonce+tag+320 read buffer.
+	payload := make([]byte, 1700)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	packet := buildServerPacketChacha(t, core, remoteSessionID, localSessionID, 1, wantAddr.String(), payload)
+	conn, err := NewUdpConn(&udpReadBufferConn{packet: packet}, core, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.sessionID = localSessionID
+
+	buf := make([]byte, 1500)
+	n, addr, err := conn.ReadFrom(buf)
+	if err == nil {
+		t.Fatalf("expected the oversize datagram to surface as dropped, got a silent success with n=%d (want the drop, not a truncated copy)", n)
+	}
+	if !stderrors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("error should unwrap to io.ErrShortBuffer: %v", err)
+	}
+	var dropped *netproxy.ErrDatagramDropped
+	if !stderrors.As(err, &dropped) {
+		t.Fatalf("error should carry the typed datagram-dropped contract: %v", err)
+	}
+	if addr != wantAddr {
+		t.Fatalf("unexpected addr on the dropped datagram: got %v want %v", addr, wantAddr)
+	}
+}

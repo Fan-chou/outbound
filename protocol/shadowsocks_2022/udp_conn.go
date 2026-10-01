@@ -558,6 +558,14 @@ func (c *UdpConn) readFromChacha(b []byte) (n int, addr netip.AddrPort, err erro
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
+	if len(payload) > len(b) {
+		// The decrypted datagram does not fit the caller's buffer. The read
+		// buffer's slack (+320) lets the wire datagram arrive and
+		// authenticate fully, so the oversize is known exactly here:
+		// surface it as a dropped datagram per the typed read contract
+		// instead of silently truncating a successful return.
+		return 0, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
+	}
 	return copy(b, payload), addr, nil
 }
 

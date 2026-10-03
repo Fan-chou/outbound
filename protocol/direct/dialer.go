@@ -40,9 +40,17 @@ type Dialers = DirectDialers
 // NewDirectDialers builds a generation-scoped pair. It does not modify the
 // exported globals; call InitDirectDialers to publish a pair process-wide.
 func NewDirectDialers(fallbackDNS string) DirectDialers {
+	return NewDirectDialersWithOption(Option{FallbackDNS: fallbackDNS})
+}
+
+// NewDirectDialersWithOption builds an immutable pair with shared TCP options.
+// FullCone is selected independently for each member of the pair.
+func NewDirectDialersWithOption(option Option) DirectDialers {
+	symmetric, fullcone := option, option
+	symmetric.FullCone, fullcone.FullCone = false, true
 	return DirectDialers{
-		Symmetric: NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: false, FallbackDNS: fallbackDNS}),
-		Fullcone:  NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: true, FallbackDNS: fallbackDNS}),
+		Symmetric: NewDirectDialerLaddr(netip.Addr{}, symmetric),
+		Fullcone:  NewDirectDialerLaddr(netip.Addr{}, fullcone),
 	}
 }
 
@@ -97,6 +105,9 @@ func (d *lazyDirectDialer) LookupIPAddr(ctx context.Context, network, host strin
 type Option struct {
 	FullCone    bool
 	FallbackDNS string
+	// TCPMaxSeg overrides Linux TCP_MAXSEG for application TCP sockets only.
+	// Zero preserves the kernel default. Resolver and UDP sockets are unchanged.
+	TCPMaxSeg int
 }
 
 type directDialer struct {
@@ -282,7 +293,19 @@ func (d *directDialer) dialTcp(ctx context.Context, addr string, mark int, ipVer
 	} else {
 		dialer = *d.tcpDialer
 	}
-	if mark != 0 {
+	if err := netproxy.ValidateTCPMaxSeg(d.Option.TCPMaxSeg); err != nil {
+		return nil, err
+	}
+	if d.Option.TCPMaxSeg != 0 {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			if mark != 0 {
+				if err := netproxy.SoMarkControl(c, mark); err != nil {
+					return err
+				}
+			}
+			return netproxy.TCPMaxSegControl(c, d.Option.TCPMaxSeg)
+		}
+	} else if mark != 0 {
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
 			return netproxy.SoMarkControl(c, mark)
 		}

@@ -13,6 +13,28 @@ func resetGlobalDirectDialers() {
 	globalDirectDialers.Store(nil)
 }
 
+func TestTCPOptionsBelongToDirectDialerGeneration(t *testing.T) {
+	before := publishedPair()
+	option := Option{FallbackDNS: "127.0.0.1:5353", TCPMaxSeg: 1380}
+	first := NewDirectDialersWithOption(option)
+	option.TCPMaxSeg = 1200
+	second := NewDirectDialersWithOption(option)
+	for _, member := range []netproxy.Dialer{first.Symmetric, first.Fullcone} {
+		if got := member.(*directDialer).Option.TCPMaxSeg; got != 1380 {
+			t.Fatalf("existing generation MSS changed: %d", got)
+		}
+	}
+	if got := second.Symmetric.(*directDialer).Option.TCPMaxSeg; got != 1200 {
+		t.Fatalf("new generation MSS = %d", got)
+	}
+	if first.Symmetric.(*directDialer).Option.FullCone || !first.Fullcone.(*directDialer).Option.FullCone {
+		t.Fatal("pair lost cone selection")
+	}
+	if publishedPair() != before {
+		t.Fatal("experiment published process-wide dialers")
+	}
+}
+
 func publishedPair() *DirectDialers {
 	return globalDirectDialers.Load()
 }

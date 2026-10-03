@@ -60,4 +60,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20261003042709-d2a724750f5d
+replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20261003051923-42916a975611

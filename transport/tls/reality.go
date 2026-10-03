@@ -198,6 +198,20 @@ type Reality struct {
 	// both shapes failed, so a dead or blocked server is not dialled twice on
 	// every single connection.
 	pqRetryAfter atomic.Int64
+	pqProbing    atomic.Bool
+}
+
+// claimHelloProbe admits one alternate-shape probe after the fixed backoff.
+// Single-shape failures during backoff do not move its deadline.
+func (x *Reality) claimHelloProbe(now time.Time) bool {
+	if now.Unix() < x.pqRetryAfter.Load() || !x.pqProbing.CompareAndSwap(false, true) {
+		return false
+	}
+	if now.Unix() < x.pqRetryAfter.Load() {
+		x.pqProbing.Store(false)
+		return false
+	}
+	return true
 }
 
 // dropHybridKeyShare removes the post-quantum X25519MLKEM768 group from the
@@ -363,6 +377,10 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 		retryHybrid := false
 		hybridHello := x.pqHybrid.Load()
 	retryHandshake:
+		if err := ctx.Err(); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
 		uConn := &RealityUConn{}
 		utlsConfig := &utls.Config{
 			VerifyPeerCertificate:  uConn.VerifyPeerCertificate,
@@ -405,7 +423,6 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 					_ = c.Close()
 					return nil, fmt.Errorf("REALITY: fingerprint %s %s does not provide a usable TLS 1.3 key share", x.fingerprint.Client, x.fingerprint.Version)
 				}
-				_ = c.Close() // this attempt's underlay is orphaned by the retry
 				retry++
 				goto retryHandshake // retry
 			}
@@ -426,6 +443,9 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 		}
 		// logrus.Println("00")
 		if err := uConn.HandshakeContext(ctx); err != nil {
+			if retryHybrid && ctx.Err() == nil {
+				x.pqRetryAfter.Store(time.Now().Add(realityBothShapesBackoff).Unix())
+			}
 			_ = c.Close()
 			return nil, err
 		}
@@ -439,16 +459,22 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 			// payload. Retry once with the other ClientHello shape, because the
 			// shape is what differs between server generations, then give up and
 			// act as cover traffic.
-			if !retryHybrid && (hybridHello || time.Now().Unix() >= x.pqRetryAfter.Load()) {
+			if !retryHybrid && x.claimHelloProbe(time.Now()) {
+				defer x.pqProbing.Store(false)
 				retryHybrid = true
 				hybridHello = !hybridHello
 				_ = c.Close()
-				if next, dialErr := x.nextDialer.DialContext(ctx, network, addr); dialErr == nil {
-					c = next
-					goto retryHandshake
+				next, dialErr := x.nextDialer.DialContext(ctx, network, addr)
+				if dialErr != nil {
+					return nil, fmt.Errorf("[REALITY]: alternate hello dial: %w", dialErr)
 				}
+				c = next
+				retry = 1
+				goto retryHandshake
 			}
-			x.pqRetryAfter.Store(time.Now().Add(realityBothShapesBackoff).Unix())
+			if retryHybrid {
+				x.pqRetryAfter.Store(time.Now().Add(realityBothShapesBackoff).Unix())
+			}
 			// Trigger spider. This goroutine lives as long as the process and
 			// nothing else owns it, so an unhandled panic here would take the
 			// whole process down; contain it and report it instead.

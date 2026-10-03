@@ -148,6 +148,42 @@ func TestReadFromDoesNotSplitLeftoverAsSecondDatagram(t *testing.T) {
 	}
 }
 
+func TestPacketAddrPayloadCapacityAndFollowingDatagram(t *testing.T) {
+	for _, target := range []string{"192.0.2.1:53", "[2001:db8::1]:53"} {
+		for _, size := range []int{0, 128, 4096} {
+			for _, short := range []bool{false, true} {
+				if short && size == 0 {
+					continue
+				}
+				payload := bytes.Repeat([]byte{42}, size)
+				addr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(target))
+				first, wantAddr := framePacketAddrDatagram(t, addr, payload)
+				second, _ := framePacketAddrDatagram(t, addr, []byte("next"))
+				c := newDirectReadPacketAddrConn(append(first, second...))
+				capacity := size
+				if short {
+					capacity--
+				}
+				out := make([]byte, capacity)
+				n, got, err := c.ReadFrom(out)
+				if short {
+					var dropped *netproxy.ErrDatagramDropped
+					if n != 0 || !errors.As(err, &dropped) {
+						t.Fatalf("%s size=%d short: n=%d err=%v", target, size, n, err)
+					}
+				} else if err != nil || got != wantAddr || n != size || !bytes.Equal(out[:n], payload) {
+					t.Fatalf("%s size=%d exact: n=%d addr=%v err=%v", target, size, n, got, err)
+				}
+				next := make([]byte, 4)
+				n, got, err = c.ReadFrom(next)
+				if err != nil || n != 4 || string(next) != "next" || got != wantAddr {
+					t.Fatalf("next packet desynchronized: %q %v", next, err)
+				}
+			}
+		}
+	}
+}
+
 type identityAEAD struct{}
 
 func (identityAEAD) NonceSize() int { return 12 }

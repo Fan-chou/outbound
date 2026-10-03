@@ -2,9 +2,11 @@ package vmess
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 )
 
@@ -22,28 +24,30 @@ func (c *Conn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 		}
 		return n, tgt, nil
 	}
-	// Read the datagram straight into the caller's buffer. Staging it through a
-	// pooled MaxUDPSize (2048) frame buffer capped every packetaddr datagram at
-	// 2048 bytes regardless of the caller's capacity, so larger replies (for
-	// example EDNS0 DNS answers) were drained and reported as dropped. c.read
-	// already reports a caller-side short buffer as a typed datagram-dropped
-	// error, so no copy or cap is needed here.
-	n, err = c.read(p)
+	// The caller's capacity covers payload only. Allow room for the largest
+	// packet address, bounded by the VMess chunk's 16-bit length field.
+	frameSize := 0xffff
+	if len(p) < frameSize-19 {
+		frameSize = len(p) + 19
+	}
+	buf := pool.Get(frameSize)
+	defer pool.Put(buf)
+	n, err = c.read(buf)
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
 	if n == 0 {
 		return 0, netip.AddrPort{}, fmt.Errorf("not enough data to read for PacketAddr")
 	}
-	addrTyp, address, err := ExtractPacketAddr(p[:n])
+	addrTyp, address, err := ExtractPacketAddr(buf[:n])
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	// ExtractPacketAddr rejects a datagram shorter than its own packet address,
-	// so addrLen <= n here. The address is a prefix of the datagram; compacting
-	// it out is a forward-overlapping copy, which copy handles correctly.
 	addrLen := PacketAddrLength(addrTyp)
-	return copy(p, p[addrLen:n]), address, nil
+	if n-addrLen > len(p) {
+		return 0, netip.AddrPort{}, netproxy.DatagramDropped(io.ErrShortBuffer)
+	}
+	return copy(p, buf[addrLen:n]), address, nil
 }
 
 func (c *Conn) WriteTo(p []byte, addr string) (n int, err error) {

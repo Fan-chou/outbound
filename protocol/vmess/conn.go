@@ -25,7 +25,7 @@ const (
 	// MaxUDPSize is retained for API compatibility. It is NOT a read-path cap:
 	// staging UDP reads through a buffer of this size silently dropped every
 	// datagram larger than 2048 bytes regardless of the caller's capacity.
-	// ReadFrom now reads into the caller's buffer instead.
+	// ReadFrom sizes its temporary frame buffer for payload plus address.
 	MaxUDPSize = 1 << 11
 
 	maxReusableSealFrameSize = 128 << 10

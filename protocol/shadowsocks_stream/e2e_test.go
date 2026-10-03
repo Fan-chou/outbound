@@ -211,7 +211,7 @@ type streamEncryptWriter struct {
 func (w *streamEncryptWriter) Write(b []byte) (int, error) {
 	if !w.started {
 		iv := make([]byte, w.cipher.InfoIVLen())
-		enc, err := w.cipher.NewEncryptorInto(iv)
+		enc, err := w.cipher.NewEncryptor(iv)
 		if err != nil {
 			return 0, err
 		}
@@ -920,7 +920,7 @@ func serveSSStreamUDP(t *testing.T, pc net.PacketConn, method, password string) 
 		plain := append(socksAddressBytes(src.IP.String(), src.Port), resp[:m]...)
 
 		out := make([]byte, sc.InfoIVLen()+len(plain))
-		enc, err := sc.NewEncryptorInto(out)
+		enc, err := sc.NewEncryptor(out)
 		if err != nil {
 			return
 		}

@@ -35,6 +35,7 @@ import (
 	"unsafe"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pkg/logger"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"

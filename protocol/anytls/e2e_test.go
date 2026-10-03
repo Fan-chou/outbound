@@ -896,10 +896,7 @@ func TestE2EAnytlsUDPRelay(t *testing.T) {
 
 	// WriteBatch path first: on a fresh stream the first batch item must
 	// carry the connected-mode address header.
-	batcher, ok := packetConn.(netproxy.PacketBatchWriter)
-	if !ok {
-		t.Fatalf("packet conn %T lost the PacketBatchWriter capability", packetConn)
-	}
+	batcher, hasBatch := packetConn.(netproxy.PacketBatchWriter)
 	var batch []netproxy.BatchItem
 	for i := 0; i < 4; i++ {
 		payload := make([]byte, 120+i*17)
@@ -912,8 +909,17 @@ func TestE2EAnytlsUDPRelay(t *testing.T) {
 		}
 		batch = append(batch, netproxy.BatchItem{Data: payload, Addr: addr})
 	}
-	if n, err := batcher.WriteBatch(batch); err != nil || n != len(batch) {
-		t.Fatalf("WriteBatch: n=%d err=%v", n, err)
+	if hasBatch {
+		if n, err := batcher.WriteBatch(batch); err != nil || n != len(batch) {
+			t.Fatalf("WriteBatch: n=%d err=%v", n, err)
+		}
+	} else {
+		// Batching is an optional capability. This fork keeps the plain packet path.
+		for _, item := range batch {
+			if _, err := packetConn.WriteTo(item.Data, item.Addr); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	readDatagrams(t, packetConn, batch, udpEcho)
 

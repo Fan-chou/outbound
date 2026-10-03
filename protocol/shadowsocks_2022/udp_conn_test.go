@@ -2,6 +2,7 @@ package shadowsocks_2022
 
 import (
 	"encoding/binary"
+	stderrors "errors"
 	"io"
 	"net"
 	"net/netip"

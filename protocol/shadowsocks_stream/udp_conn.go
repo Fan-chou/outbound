@@ -69,6 +69,7 @@ func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.
 	}
 	packet.Data = payload
 	packet.From = from
+	packet.Peer = from
 	return packet, true
 }
 
@@ -221,6 +222,7 @@ func (c *UdpTransportConn) mapTransportPacket(packet *netproxy.ReceivedPacket) (
 	dec.XORKeyStream(data, data)
 	packet.Data = data
 	packet.From = netip.AddrPort{}
+	packet.Peer = netip.AddrPort{}
 	return packet, true
 }
 

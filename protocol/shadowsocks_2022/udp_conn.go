@@ -477,6 +477,7 @@ func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.
 	}
 	packet.Data = payload
 	packet.From = addr
+	packet.Peer = addr
 	return packet, true
 }
 

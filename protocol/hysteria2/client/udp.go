@@ -111,20 +111,25 @@ func (u *udpConn) Write(b []byte) (n int, err error) {
 }
 
 func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
+	n, addr, _, err = u.ReadFromWithPeer(p)
+	return
+}
+
+func (u *udpConn) ReadFromWithPeer(p []byte) (n int, addr, peer netip.AddrPort, err error) {
 	for {
 		ctx := u.readDeadline.Context()
 		if err := context.Cause(ctx); err != nil {
-			return 0, netip.AddrPort{}, err
+			return 0, netip.AddrPort{}, netip.AddrPort{}, err
 		}
 		var msg *protocol.UDPMessage
 		select {
 		case msg = <-u.ReceiveCh:
 		case <-ctx.Done():
-			return 0, netip.AddrPort{}, context.Cause(ctx)
+			return 0, netip.AddrPort{}, netip.AddrPort{}, context.Cause(ctx)
 		}
 		if msg == nil {
 			// Closed
-			return 0, netip.AddrPort{}, io.EOF
+			return 0, netip.AddrPort{}, netip.AddrPort{}, io.EOF
 		}
 		dfMsg := u.feedMessage(msg)
 		if dfMsg == nil {
@@ -134,7 +139,11 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 		from, err := u.addrForMessage(dfMsg.Addr)
 		if err != nil {
 			releaseUDPMessage(dfMsg)
-			return 0, netip.AddrPort{}, err
+			return 0, netip.AddrPort{}, netip.AddrPort{}, err
+		}
+		peer = from
+		if u.natIdentity.IsValid() {
+			peer, _ = u.peerForMessage(dfMsg.Addr)
 		}
 		if len(dfMsg.Data) > len(p) {
 			// The datagram is consumed either way; a short caller buffer
@@ -142,11 +151,11 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 			// silently truncated packet.
 			n := copy(p, dfMsg.Data)
 			releaseUDPMessage(dfMsg)
-			return n, from, netproxy.DatagramDropped(io.ErrShortBuffer)
+			return n, from, peer, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		n := copy(p, dfMsg.Data)
 		releaseUDPMessage(dfMsg)
-		return n, from, nil
+		return n, from, peer, nil
 	}
 }
 
@@ -199,6 +208,10 @@ func (u *udpConn) addrForMessage(addr []byte) (netip.AddrPort, error) {
 	if u.natIdentity.IsValid() {
 		return u.natIdentity, nil
 	}
+	return u.peerForMessage(addr)
+}
+
+func (u *udpConn) peerForMessage(addr []byte) (netip.AddrPort, error) {
 	if bytes.Equal(addr, u.targetBytes) && u.defaultTargetAddr.IsValid() {
 		return u.defaultTargetAddr, nil
 	}
@@ -241,6 +254,9 @@ func (u *udpConn) deliverMessage(msg *protocol.UDPMessage) bool {
 		return true
 	}
 	packet := netproxy.NewReceivedPacket(msg.Data, from, nil, msg.Release)
+	if u.natIdentity.IsValid() {
+		packet.Peer, _ = u.peerForMessage(msg.Addr)
+	}
 	if handler(packet) {
 		return true
 	}

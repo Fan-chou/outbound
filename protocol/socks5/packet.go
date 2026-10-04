@@ -81,6 +81,7 @@ func (pc *PktConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy
 	}
 	packet.Data = payload
 	packet.From = from
+	packet.Peer = from
 	return packet, true
 }
 

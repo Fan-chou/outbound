@@ -29,6 +29,9 @@ func (paritySentinelConn) WriteDeadlineClosesSession() bool { return true }
 func (paritySentinelConn) ReadFrom([]byte) (int, netip.AddrPort, error) {
 	return 0, netip.AddrPort{}, nil
 }
+func (paritySentinelConn) ReadFromWithPeer([]byte) (int, netip.AddrPort, netip.AddrPort, error) {
+	return 0, netip.AddrPort{}, netip.AddrPort{}, nil
+}
 func (paritySentinelConn) WriteTo([]byte, string) (int, error) { return 0, nil }
 func (paritySentinelConn) WriteBatch([]BatchItem) (int, error) { return 0, nil }
 func (paritySentinelConn) RegisterPacketReceiver(PacketReceiveHandler) (func(), bool) {

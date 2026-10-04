@@ -19,6 +19,7 @@ var optionalCapabilityMethods = []string{
 	"CloseWrite",
 	"WriteDeadlineClosesSession",
 	"ReadFrom",
+	"ReadFromWithPeer",
 	"WriteTo",
 	"WriteBatch",
 	"RegisterPacketReceiver",

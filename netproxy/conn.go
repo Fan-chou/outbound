@@ -38,6 +38,23 @@ type PacketConn interface {
 	SetWriteDeadline(t time.Time) error
 }
 
+// PacketPeerReader preserves the application peer reported by the transport
+// separately from the address used for userspace NAT reply injection. A zero
+// peer means the wire address cannot be attributed to an IP:port.
+type PacketPeerReader interface {
+	ReadFromWithPeer(p []byte) (n int, from, peer netip.AddrPort, err error)
+}
+
+// ReadFromWithPeer keeps ordinary PacketConn implementations compatible.
+// Protocol decoders must expose their decoded peer, never the proxy next hop.
+func ReadFromWithPeer(conn PacketConn, p []byte) (n int, from, peer netip.AddrPort, err error) {
+	if reader, ok := conn.(PacketPeerReader); ok {
+		return reader.ReadFromWithPeer(p)
+	}
+	n, from, err = conn.ReadFrom(p)
+	return n, from, from, err
+}
+
 // BatchItem is one datagram for a batched packet write. Data must remain
 // valid until the WriteBatch call returns.
 type BatchItem struct {
@@ -62,6 +79,9 @@ type PacketBatchWriter interface {
 type ReceivedPacket struct {
 	Data []byte
 	From netip.AddrPort
+	// Peer is the application source before any userspace NAT identity rewrite.
+	// Consumers must not replace an unknown Peer with From.
+	Peer netip.AddrPort
 	Err  error
 
 	releaseOnce sync.Once
@@ -74,6 +94,7 @@ func NewReceivedPacket(data []byte, from netip.AddrPort, err error, release func
 	return &ReceivedPacket{
 		Data:    data,
 		From:    from,
+		Peer:    from,
 		Err:     err,
 		release: release,
 	}

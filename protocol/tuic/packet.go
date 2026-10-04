@@ -492,6 +492,10 @@ func (q *quicStreamPacketConn) addrPortFrom(addr *Address) netip.AddrPort {
 	if q.natIdentity.IsValid() {
 		return q.natIdentity
 	}
+	return q.peerFrom(addr)
+}
+
+func (q *quicStreamPacketConn) peerFrom(addr *Address) netip.AddrPort {
 	if addr == nil {
 		return netip.AddrPort{}
 	}
@@ -512,26 +516,31 @@ func (q *quicStreamPacketConn) addrPortFromAssembled(from netip.AddrPort) netip.
 }
 
 func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
+	n, addr, _, err = q.ReadFromWithPeer(p)
+	return
+}
+
+func (q *quicStreamPacketConn) ReadFromWithPeer(p []byte) (n int, addr, peer netip.AddrPort, err error) {
 	q.mu.Lock()
 	incomingPackets := q.incomingPackets
 	q.mu.Unlock()
 
 	if incomingPackets == nil {
-		return 0, netip.AddrPort{}, net.ErrClosed
+		return 0, netip.AddrPort{}, netip.AddrPort{}, net.ErrClosed
 	}
 	ctx := q.readDeadline.Context()
 	for {
 		if err := context.Cause(ctx); err != nil {
-			return 0, netip.AddrPort{}, err
+			return 0, netip.AddrPort{}, netip.AddrPort{}, err
 		}
 		var packet *Packet
 		select {
 		case packet = <-incomingPackets.ch:
 			if packet == nil {
-				return 0, netip.AddrPort{}, net.ErrClosed
+				return 0, netip.AddrPort{}, netip.AddrPort{}, net.ErrClosed
 			}
 		case <-ctx.Done():
-			return 0, netip.AddrPort{}, context.Cause(ctx)
+			return 0, netip.AddrPort{}, netip.AddrPort{}, context.Cause(ctx)
 		}
 		if packet.FRAG_TOTAL <= 1 {
 			if packet.ADDR == nil {
@@ -541,13 +550,14 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 			full := len(packet.DATA)
 			n := copy(p, packet.DATA)
 			addr := q.addrPortFrom(packet.ADDR)
+			peer := q.peerFrom(packet.ADDR)
 			packet.releaseData()
 			if full > len(p) {
 				// The datagram is consumed either way; delivering the truncated
 				// bytes as success would corrupt it silently. Surface the drop.
-				return n, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
+				return n, addr, peer, netproxy.DatagramDropped(io.ErrShortBuffer)
 			}
-			return n, addr, nil
+			return n, addr, peer, nil
 		}
 		nowNano := time.Now().UnixNano()
 		q.maybeCleanupDeFraggers(nowNano)
@@ -563,7 +573,7 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 			if bucket.len() == 0 {
 				q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
 			}
-			return n, q.addrPortFromAssembled(addr), nil
+			return n, q.addrPortFromAssembled(addr), addr, nil
 		} else if assembledLen > len(p) {
 			buffer := pool.GetFullCap(assembledLen)
 			n, addr, assembled, _ := bucket.feed(nil, buffer, nowNano)
@@ -576,9 +586,9 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 				// Caller buffer smaller than the reassembled datagram:
 				// surface the drop instead of silently corrupting it.
 				if n > len(p) {
-					return copyN, q.addrPortFromAssembled(addr), netproxy.DatagramDropped(io.ErrShortBuffer)
+					return copyN, q.addrPortFromAssembled(addr), addr, netproxy.DatagramDropped(io.ErrShortBuffer)
 				}
-				return copyN, q.addrPortFromAssembled(addr), nil
+				return copyN, q.addrPortFromAssembled(addr), addr, nil
 			}
 			buffer.Put()
 		}
@@ -627,6 +637,7 @@ func (q *quicStreamPacketConn) deliverPacket(handler netproxy.PacketReceiveHandl
 			nil,
 			packet.releaseData,
 		)
+		received.Peer = q.peerFrom(packet.ADDR)
 		if handler(received) {
 			return true
 		}
@@ -658,6 +669,7 @@ func (q *quicStreamPacketConn) deliverPacket(handler netproxy.PacketReceiveHandl
 		q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
 	}
 	received := netproxy.NewReceivedPacket(buffer[:n], q.addrPortFromAssembled(addr), nil, buffer.Put)
+	received.Peer = addr
 	if handler(received) {
 		return true
 	}

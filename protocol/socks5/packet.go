@@ -87,6 +87,15 @@ func (pc *PktConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy
 
 var parseSocksAddr = socks.ParseAddr
 
+func (pc *PktConn) PacketRecoveryCapabilities() netproxy.PacketRecoveryCapabilities {
+	underlay := netproxy.RecoveryCapabilities(pc.PacketConn)
+	return netproxy.PacketRecoveryCapabilities{
+		LocalWriteCompleted:    underlay.LocalWriteCompleted,
+		IndependentAssociation: underlay.IndependentAssociation && pc.ctrlConn != nil,
+		AddressedWrites:        true, ApplicationPeer: true,
+	}
+}
+
 // NewPktConn returns a PktConn, the writeAddr must be *net.UDPAddr or *net.UnixAddr.
 func NewPktConn(c netproxy.PacketConn, proxyAddr string, targetAddr string, ctrlConn netproxy.Conn) *PktConn {
 	ctx, cancel := context.WithCancel(context.Background())

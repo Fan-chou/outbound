@@ -33,6 +33,13 @@ type directPacketConn struct {
 	batchWriter        packetBatchWriter
 }
 
+func (c *directPacketConn) PacketRecoveryCapabilities() netproxy.PacketRecoveryCapabilities {
+	return netproxy.PacketRecoveryCapabilities{
+		LocalWriteCompleted: true, IndependentAssociation: true,
+		AddressedWrites: c.FullCone, ApplicationPeer: true,
+	}
+}
+
 // Close unregisters the socket from the shared packet receiver before closing
 // its underlying UDP descriptor.
 func (c *directPacketConn) Close() error {

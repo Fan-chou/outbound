@@ -48,6 +48,15 @@ type UdpConn struct {
 
 var _ netproxy.PacketReceiver = (*UdpConn)(nil)
 
+func (c *UdpConn) PacketRecoveryCapabilities() netproxy.PacketRecoveryCapabilities {
+	underlay := netproxy.RecoveryCapabilities(c.PacketConn)
+	return netproxy.PacketRecoveryCapabilities{
+		LocalWriteCompleted:    underlay.LocalWriteCompleted,
+		IndependentAssociation: underlay.IndependentAssociation,
+		AddressedWrites:        true, ApplicationPeer: true,
+	}
+}
+
 func (c *UdpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
 	receiver, ok := c.PacketConn.(netproxy.PacketReceiver)
 	if !ok {

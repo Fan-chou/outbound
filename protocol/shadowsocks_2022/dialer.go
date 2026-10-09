@@ -27,6 +27,12 @@ func (c *FakeNetPacketConn) Write(p []byte) (int, error) {
 	return c.WriteTo(p, c.Addr)
 }
 
+// The embedded interface hides UdpConn's optional methods; forward the
+// recovery promise explicitly so the wrapper neither drops nor widens it.
+func (c *FakeNetPacketConn) PacketRecoveryCapabilities() netproxy.PacketRecoveryCapabilities {
+	return netproxy.RecoveryCapabilities(c.PacketConn)
+}
+
 func (c *FakeNetPacketConn) Read(p []byte) (int, error) {
 	n, _, err := c.ReadFrom(p)
 	return n, err

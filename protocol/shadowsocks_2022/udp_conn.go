@@ -445,6 +445,22 @@ func (c *UdpConn) targetAddrInfo(addr string) (socks5.AddressInfo, error) {
 
 var _ netproxy.PacketReceiver = (*UdpConn)(nil)
 
+// PacketRecoveryCapabilities forwards only what the UDP underlay promises.
+// Every UdpConn owns its own underlay socket and random client session ID,
+// so a new connection is a new server session. Writes are synchronous,
+// addressed per datagram, and replies decode the application peer.
+func (c *UdpConn) PacketRecoveryCapabilities() netproxy.PacketRecoveryCapabilities {
+	var underlay netproxy.PacketRecoveryCapabilities
+	if pc, ok := c.Conn.(netproxy.PacketConn); ok {
+		underlay = netproxy.RecoveryCapabilities(pc)
+	}
+	return netproxy.PacketRecoveryCapabilities{
+		LocalWriteCompleted:    underlay.LocalWriteCompleted,
+		IndependentAssociation: underlay.IndependentAssociation,
+		AddressedWrites:        true, ApplicationPeer: true,
+	}
+}
+
 func (c *UdpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
 	receiver, ok := c.Conn.(netproxy.PacketReceiver)
 	if !ok {

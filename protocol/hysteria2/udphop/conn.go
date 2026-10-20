@@ -175,8 +175,25 @@ func NewUDPHopPacketConnContext(ctx context.Context, addr *UDPHopAddr, hopInterv
 	}
 	go hConn.recvLoop(curConn)
 	go hConn.hopLoop()
+	if _, ok := curConn.(syscall.Conn); !ok {
+		// Proxied underlay (no raw socket fd). Hide the OOB/batch surface
+		// from QUIC's capability probes: udpHopPacketConn advertises
+		// ReadMsgUDP/WriteMsgUDP/SyscallConn/ReadBatch, and quic-go's newConn
+		// aborts the dial when SyscallConn fails. With the surface hidden the
+		// transport falls back to plain ReadFrom/WriteTo, which the hop conn
+		// fully supports. The probe mirrors recvLoop's own capability check.
+		return &oobBlindPacketConn{PacketConn: hConn}, nil
+	}
 	return hConn, nil
 }
+
+// oobBlindPacketConn wraps a udpHopPacketConn whose underlay has no raw
+// socket. Embedding only the net.PacketConn interface leaves the hop conn's
+// OOB, batch, and SyscallConn methods unpromoted, so capability probes based
+// on method presence (quic.OOBCapablePacketConn, syscall.Conn, ReadBatch,
+// SetReadBuffer) all report "unsupported" and callers stay on the portable
+// ReadFrom/WriteTo path.
+type oobBlindPacketConn struct{ net.PacketConn }
 
 func (u *udpHopPacketConn) recvLoop(conn net.PacketConn) {
 	// Use recvmmsg batch reads when the underlying conn exposes a raw socket

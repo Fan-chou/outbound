@@ -329,7 +329,12 @@ func TestUDPHopPacketConnFreezesResolvedIPForSubsequentHops(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPHopPacketConn() error = %v", err)
 	}
-	hConn := conn.(*udpHopPacketConn)
+	// The stub underlay has no raw socket, so the hop conn is returned wrapped
+	// in oobBlindPacketConn; unwrap it to reach the hop internals.
+	hConn, ok := conn.(*udpHopPacketConn)
+	if !ok {
+		hConn = conn.(*oobBlindPacketConn).PacketConn.(*udpHopPacketConn)
+	}
 	defer func() { _ = hConn.Close() }()
 
 	gotRemoteAddr := hConn.RemoteAddr()

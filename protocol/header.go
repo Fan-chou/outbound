@@ -5,14 +5,22 @@ import "crypto/tls"
 type Header struct {
 	ProxyAddress string
 	SNI          string
-	Feature1     interface{}
-	Feature2     interface{}
-	TlsConfig    *tls.Config
-	Cipher       string
-	User         string
-	Password     string
-	IsClient     bool
-	Flags        Flags
+	// Feature1 carries a protocol-specific, per-protocol-typed value. The type
+	// is part of each protocol's contract, and every dialer must type-assert it
+	// with the ok form and return a descriptive error on mismatch instead of
+	// panicking, because Header is an exported API:
+	//   hysteria2     -> *hysteria2.Feature1
+	//   vmess         -> string (the gRPC service name)
+	//   vless         -> string (the flow value)
+	//   tuic, juicity -> string (the server-echoed congestion controller)
+	Feature1  interface{}
+	Feature2  interface{}
+	TlsConfig *tls.Config
+	Cipher    string
+	User      string
+	Password  string
+	IsClient  bool
+	Flags     Flags
 }
 
 type Flags uint64

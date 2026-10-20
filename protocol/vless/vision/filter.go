@@ -46,6 +46,7 @@ func (vc *Conn) stopFilteringLocked() {
 type filterSnapshot struct {
 	packetsToFilter int
 	isTLS           bool
+	isTLS12orAbove  bool
 	enableXTLS      bool
 }
 
@@ -59,8 +60,29 @@ func (vc *Conn) filterSnapshot() filterSnapshot {
 	return filterSnapshot{
 		packetsToFilter: vc.packetsToFilter,
 		isTLS:           vc.isTLS,
+		isTLS12orAbove:  vc.isTLS12orAbove,
 		enableXTLS:      vc.enableXTLS,
 	}
+}
+
+// isCompleteAppDataRecords reports whether b consists solely of one or more
+// complete TLS ApplicationData (0x17 0x03 0x03) records. Invariant: Vision must
+// never switch to Direct mode in the middle of a record.
+func isCompleteAppDataRecords(b []byte) bool {
+	if len(b) < 6 {
+		return false
+	}
+	for len(b) > 0 {
+		if len(b) < 5 || !bytes.Equal(b[:3], tlsApplicationDataStart) {
+			return false
+		}
+		recordLen := int(binary.BigEndian.Uint16(b[3:5]))
+		if recordLen == 0 || len(b)-5 < recordLen {
+			return false
+		}
+		b = b[5+recordLen:]
+	}
+	return true
 }
 
 func (vc *Conn) filterTLSLocked(buffer []byte) (index int) {
@@ -78,8 +100,19 @@ func (vc *Conn) filterTLSLocked(buffer []byte) (index int) {
 					vc.remainingServerHello = binary.BigEndian.Uint16(buffer[index+3:]) + 5
 					vc.isTLS12orAbove = true
 					if lenP-index >= 79 && vc.remainingServerHello >= 79 {
+						// RFC 8446 4.1.2: legacy_session_id is opaque<0..32>.
+						// The pre-fix code indexed the cipher suite without
+						// validating that length, so an oversized field read
+						// past the end of the buffer (panic on a hostile
+						// ServerHello). A length outside the RFC range skips
+						// cipher discovery: vc.cipher stays 0, XTLS stays
+						// false, and the connection falls back to plain VLESS
+						// relaying - the fail-safe direction.
 						sessionIDLen := int(buffer[index+43])
-						vc.cipher = binary.BigEndian.Uint16(buffer[index+43+sessionIDLen+1:])
+						cipherOff := index + 44 + sessionIDLen
+						if sessionIDLen <= 32 && cipherOff+2 <= lenP {
+							vc.cipher = binary.BigEndian.Uint16(buffer[cipherOff:])
+						}
 					}
 				}
 			}

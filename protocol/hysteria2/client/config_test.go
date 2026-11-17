@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"testing"
+
+	"github.com/olicesx/quic-go/quicvarint"
 )
 
 func baseTestClientConfig() *Config {
@@ -14,6 +16,30 @@ func baseTestClientConfig() *Config {
 			},
 		},
 		ServerAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443},
+	}
+}
+
+func TestVerifyAndFillWindowUpperBounds(t *testing.T) {
+	for _, field := range []string{"initial_stream", "max_stream", "initial_connection", "max_connection"} {
+		t.Run(field, func(t *testing.T) {
+			for _, value := range []uint64{quicvarint.Max, quicvarint.Max + 1, ^uint64(0)} {
+				cfg := baseTestClientConfig()
+				switch field {
+				case "initial_stream":
+					cfg.QUICConfig.InitialStreamReceiveWindow = value
+				case "max_stream":
+					cfg.QUICConfig.MaxStreamReceiveWindow = value
+				case "initial_connection":
+					cfg.QUICConfig.InitialConnectionReceiveWindow = value
+				case "max_connection":
+					cfg.QUICConfig.MaxConnectionReceiveWindow = value
+				}
+				_, err := NewClient(cfg)
+				if (err != nil) != (value > quicvarint.Max) {
+					t.Fatalf("NewClient with %s=%d: error=%v", field, value, err)
+				}
+			}
+		})
 	}
 }
 

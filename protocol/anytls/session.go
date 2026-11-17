@@ -371,11 +371,20 @@ func (s *session) needsIdleProbe(now time.Time, threshold time.Duration) bool {
 }
 
 func (s *session) probeIdleHealth(timeout time.Duration) bool {
+	if s.closed.Load() || timeout <= 0 {
+		return false
+	}
+	// Cover lock acquisition as well as I/O. A remote FIN may retire the last
+	// stream while its Write still holds connLock; closing the carrier releases
+	// that write without leaving the janitor stuck waiting for the lock.
+	deadline := time.Now().Add(timeout)
+	timer := time.AfterFunc(timeout, func() { _ = s.Close() })
+	defer timer.Stop()
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
 	if s.closed.Load() {
 		return false
 	}
-	s.probeMu.Lock()
-	defer s.probeMu.Unlock()
 
 	for {
 		select {
@@ -386,18 +395,17 @@ func (s *session) probeIdleHealth(timeout time.Duration) bool {
 	}
 
 drained:
-	if _, err := writeFrameWithDeadline(s, newFrame(cmdHeartRequest, 0), time.Now().Add(timeout)); err != nil {
+	if _, err := writeFrameWithDeadline(s, newFrame(cmdHeartRequest, 0), deadline); err != nil {
 		return false
 	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 	select {
 	case <-s.heartResponseCh:
+		if s.closed.Load() || !time.Now().Before(deadline) {
+			return false
+		}
 		s.lastProbeAt.Store(time.Now().UnixNano())
 		return true
 	case <-s.done:
-		return false
-	case <-timer.C:
 		return false
 	}
 }

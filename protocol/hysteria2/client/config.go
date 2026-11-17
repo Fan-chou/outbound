@@ -9,6 +9,7 @@ import (
 
 	"github.com/daeuniverse/outbound/protocol/hysteria2/errors"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/pmtud"
+	"github.com/olicesx/quic-go/quicvarint"
 )
 
 const (
@@ -55,17 +56,21 @@ func (c *Config) verifyAndFill() error {
 	if c.ServerAddr == nil {
 		return errors.ConfigError{Field: "ServerAddr", Reason: "must be set"}
 	}
-	if c.QUICConfig.InitialStreamReceiveWindow != 0 && c.QUICConfig.InitialStreamReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.InitialStreamReceiveWindow", Reason: "must be at least 16384"}
-	}
-	if c.QUICConfig.MaxStreamReceiveWindow != 0 && c.QUICConfig.MaxStreamReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.MaxStreamReceiveWindow", Reason: "must be at least 16384"}
-	}
-	if c.QUICConfig.InitialConnectionReceiveWindow != 0 && c.QUICConfig.InitialConnectionReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.InitialConnectionReceiveWindow", Reason: "must be at least 16384"}
-	}
-	if c.QUICConfig.MaxConnectionReceiveWindow != 0 && c.QUICConfig.MaxConnectionReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.MaxConnectionReceiveWindow", Reason: "must be at least 16384"}
+	for _, window := range []struct {
+		field string
+		value uint64
+	}{
+		{"QUICConfig.InitialStreamReceiveWindow", c.QUICConfig.InitialStreamReceiveWindow},
+		{"QUICConfig.MaxStreamReceiveWindow", c.QUICConfig.MaxStreamReceiveWindow},
+		{"QUICConfig.InitialConnectionReceiveWindow", c.QUICConfig.InitialConnectionReceiveWindow},
+		{"QUICConfig.MaxConnectionReceiveWindow", c.QUICConfig.MaxConnectionReceiveWindow},
+	} {
+		if window.value != 0 && window.value < 16384 {
+			return errors.ConfigError{Field: window.field, Reason: "must be at least 16384"}
+		}
+		if window.value > quicvarint.Max {
+			return errors.ConfigError{Field: window.field, Reason: "must not exceed 4611686018427387903 (QUIC varint maximum)"}
+		}
 	}
 
 	// Fill stream windows first so un-overridden connection windows maintain at

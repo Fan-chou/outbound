@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,4 +458,236 @@ func appendLengthPrefixed(dst, payload []byte) []byte {
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(payload)))
 	dst = append(dst, lenBuf[:]...)
 	return append(dst, payload...)
+}
+
+type heartbeatMockConn struct {
+	recordingConn
+	closedCh    chan struct{}
+	closeOnce   sync.Once
+	respondBeat bool
+	heartReqs   atomic.Int32
+	onHeartReq  func(s *session)
+}
+
+func newHeartbeatMockConn(respondBeat bool) *heartbeatMockConn {
+	return &heartbeatMockConn{
+		closedCh:    make(chan struct{}),
+		respondBeat: respondBeat,
+	}
+}
+
+func (c *heartbeatMockConn) Read([]byte) (int, error) {
+	<-c.closedCh
+	return 0, net.ErrClosed
+}
+
+func (c *heartbeatMockConn) Write(p []byte) (int, error) {
+	n, err := c.recordingConn.Write(p)
+	if len(p) >= headerOverHeadSize && p[0] == cmdHeartRequest {
+		c.heartReqs.Add(1)
+		if c.onHeartReq != nil {
+			c.onHeartReq(nil)
+		}
+	}
+	return n, err
+}
+
+func (c *heartbeatMockConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closedCh) })
+	return c.recordingConn.Close()
+}
+
+func TestGetSessionDoesNotBlockOnIdleProbe(t *testing.T) {
+	conn := newHeartbeatMockConn(false)
+	d := &Dialer{
+		idleSessions: make(map[uint64]*session),
+		sessions:     make(map[uint64]*session),
+		janitorDone:  make(chan struct{}),
+	}
+	defer d.Close()
+
+	s := newSession(conn, 1)
+	s.owner = d
+	s.sendPadding = false
+	s.state.Store(sessionStateIdle)
+	// Idle well past idleSessionProbeThreshold (3s) yet under idleSessionTimeout (30s).
+	s.idleAt.Store(time.Now().Add(-10 * time.Second).UnixNano())
+	d.sessions[s.seq] = s
+	d.idleSessions[s.seq] = s
+
+	start := time.Now()
+	got, err := d.getSession(context.Background(), "tcp")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("getSession() error = %v", err)
+	}
+	if got != s {
+		t.Fatalf("getSession() = %p, want idle session %p", got, s)
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("getSession() blocked %v, want non-blocking return without synchronous probe", elapsed)
+	}
+	if reqs := conn.heartReqs.Load(); reqs != 0 {
+		t.Fatalf("getSession() sent %d heartbeat probes on hot path, want 0", reqs)
+	}
+}
+
+func TestRunIdleJanitorProbesHealthyAndCullsDeadIdleSessions(t *testing.T) {
+	t.Run("healthy session stays reusable after background probe", func(t *testing.T) {
+		clientConn, serverConn := net.Pipe()
+		defer serverConn.Close()
+
+		d := &Dialer{
+			idleSessions:       make(map[uint64]*session),
+			sessions:           make(map[uint64]*session),
+			janitorDone:        make(chan struct{}),
+			idleCheckInterval:  10 * time.Millisecond,
+			idleProbeThreshold: 20 * time.Millisecond,
+			idleProbeTimeout:   500 * time.Millisecond,
+			idleTimeout:        5 * time.Second,
+		}
+		defer d.Close()
+
+		s := newSession(clientConn, 1)
+		s.owner = d
+		s.sendPadding = false
+		s.state.Store(sessionStateIdle)
+		s.idleAt.Store(time.Now().Add(-50 * time.Millisecond).UnixNano())
+		d.sessions[s.seq] = s
+		d.idleSessions[s.seq] = s
+
+		go func() { _ = s.run() }()
+
+		// Server responds once to the janitor's heartbeat request.
+		serverDone := make(chan struct{})
+		go func() {
+			defer close(serverDone)
+			var hdr rawHeader
+			if _, err := io.ReadFull(serverConn, hdr[:]); err != nil {
+				return
+			}
+			if hdr.Cmd() == cmdHeartRequest {
+				var resp rawHeader
+				resp[0] = cmdHeartResponse
+				_, _ = serverConn.Write(resp[:])
+			}
+		}()
+
+		go d.runIdleJanitor()
+
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+			t.Fatal("janitor did not send heartbeat request")
+		}
+
+		// Wait for janitor to re-insert the probed healthy session into idleSessions.
+		deadline := time.Now().Add(time.Second)
+		var reused bool
+		for time.Now().Before(deadline) {
+			d.idleSessionLock.Lock()
+			_, inIdle := d.idleSessions[s.seq]
+			lastProbe := s.lastProbeAt.Load()
+			d.idleSessionLock.Unlock()
+			if inIdle && lastProbe > 0 {
+				reused = true
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if !reused {
+			t.Fatal("healthy session was not returned to idleSessions after background probe")
+		}
+		// Prevent a second probe cycle from hanging after our single-shot mock server finishes.
+		_ = d.Close()
+	})
+
+	t.Run("unresponsive session is culled by background janitor", func(t *testing.T) {
+		conn := newHeartbeatMockConn(false)
+		d := &Dialer{
+			idleSessions:       make(map[uint64]*session),
+			sessions:           make(map[uint64]*session),
+			janitorDone:        make(chan struct{}),
+			idleCheckInterval:  10 * time.Millisecond,
+			idleProbeThreshold: 20 * time.Millisecond,
+			idleProbeTimeout:   50 * time.Millisecond,
+			idleTimeout:        5 * time.Second,
+		}
+		defer d.Close()
+
+		s := newSession(conn, 2)
+		s.owner = d
+		s.sendPadding = false
+		s.state.Store(sessionStateIdle)
+		s.idleAt.Store(time.Now().Add(-50 * time.Millisecond).UnixNano())
+		d.sessions[s.seq] = s
+		d.idleSessions[s.seq] = s
+
+		go d.runIdleJanitor()
+
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			d.idleSessionLock.Lock()
+			idleLen := len(d.idleSessions)
+			sessLen := len(d.sessions)
+			d.idleSessionLock.Unlock()
+			if s.Closed() && idleLen == 0 && sessLen == 0 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if !s.Closed() {
+			t.Fatal("unresponsive idle session was not closed by janitor")
+		}
+		d.idleSessionLock.Lock()
+		idleLen := len(d.idleSessions)
+		sessLen := len(d.sessions)
+		d.idleSessionLock.Unlock()
+		if idleLen != 0 || sessLen != 0 {
+			t.Fatalf("dead session still tracked: idle=%d sessions=%d", idleLen, sessLen)
+		}
+	})
+}
+
+func TestIdleJanitorAndReuseConcurrencyRace(t *testing.T) {
+	for iter := 0; iter < 10; iter++ {
+		d := &Dialer{
+			idleSessions:       make(map[uint64]*session),
+			sessions:           make(map[uint64]*session),
+			janitorDone:        make(chan struct{}),
+			idleCheckInterval:  5 * time.Millisecond,
+			idleProbeThreshold: 5 * time.Millisecond,
+			idleProbeTimeout:   15 * time.Millisecond,
+			idleTimeout:        time.Second,
+		}
+		conn := newHeartbeatMockConn(false)
+		s := newSession(conn, 1)
+		s.owner = d
+		s.sendPadding = false
+		s.state.Store(sessionStateIdle)
+		s.idleAt.Store(time.Now().Add(-20 * time.Millisecond).UnixNano())
+		d.sessions[s.seq] = s
+		d.idleSessions[s.seq] = s
+
+		go d.runIdleJanitor()
+
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			if cand, err := d.popIdleSessionForReuse(); err == nil && cand != nil {
+				_ = cand.Close()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			d.maintainIdleSessions(time.Now())
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(5 * time.Millisecond)
+			_ = d.Close()
+		}()
+		wg.Wait()
+	}
 }

@@ -22,7 +22,7 @@ const (
 	sessionReadBufferSize     = 4 << 10
 	maxIdleSessions           = 1
 	idleSessionTimeout        = 30 * time.Second
-	idleSessionCheckInterval  = 10 * time.Second
+	idleSessionCheckInterval  = 1 * time.Second
 	idleSessionProbeThreshold = 3 * time.Second
 	idleSessionProbeTimeout   = 2 * time.Second
 )
@@ -46,6 +46,12 @@ type Dialer struct {
 	sessions        map[uint64]*session
 	closed          bool
 	janitorDone     chan struct{}
+
+	// Optional test overrides; zero values fall back to package constants.
+	idleCheckInterval  time.Duration
+	idleProbeThreshold time.Duration
+	idleProbeTimeout   time.Duration
+	idleTimeout        time.Duration
 }
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -153,6 +159,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 }
 
 func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, error) {
+	idleTimeout := d.effectiveIdleTimeout()
 	for {
 		candidate, err := d.popIdleSessionForReuse()
 		if err != nil {
@@ -162,12 +169,9 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 			break
 		}
 
-		now := time.Now()
-		if candidate.idleTimedOut(now, idleSessionTimeout) {
-			_ = candidate.Close()
-			continue
-		}
-		if candidate.needsIdleProbe(now, idleSessionProbeThreshold) && !candidate.probeIdleHealth(idleSessionProbeTimeout) {
+		// Health probing runs asynchronously in runIdleJanitor() so DialContext
+		// never stalls up to 2s on a half-dead idle socket.
+		if candidate.idleTimedOut(time.Now(), idleTimeout) {
 			_ = candidate.Close()
 			continue
 		}
@@ -183,6 +187,7 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("anytls requires net.Conn, got %T", rawConn)
 	}
+	tuneTCPCarrierConn(conn)
 
 	tlsConn := tls.Client(conn, d.tlsConfig)
 	if err := netproxy.HandshakeWithContext(ctx, tlsConn); err != nil {
@@ -261,31 +266,95 @@ func (d *Dialer) popIdleSessionForReuse() (*session, error) {
 	return nil, nil
 }
 
+func (d *Dialer) effectiveIdleCheckInterval() time.Duration {
+	if d.idleCheckInterval > 0 {
+		return d.idleCheckInterval
+	}
+	return idleSessionCheckInterval
+}
+
+func (d *Dialer) effectiveIdleProbeThreshold() time.Duration {
+	if d.idleProbeThreshold > 0 {
+		return d.idleProbeThreshold
+	}
+	return idleSessionProbeThreshold
+}
+
+func (d *Dialer) effectiveIdleProbeTimeout() time.Duration {
+	if d.idleProbeTimeout > 0 {
+		return d.idleProbeTimeout
+	}
+	return idleSessionProbeTimeout
+}
+
+func (d *Dialer) effectiveIdleTimeout() time.Duration {
+	if d.idleTimeout > 0 {
+		return d.idleTimeout
+	}
+	return idleSessionTimeout
+}
+
 func (d *Dialer) runIdleJanitor() {
-	ticker := time.NewTicker(idleSessionCheckInterval)
+	ticker := time.NewTicker(d.effectiveIdleCheckInterval())
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			d.closeExpiredIdleSessions(time.Now())
+			d.maintainIdleSessions(time.Now())
 		case <-d.janitorDone:
 			return
 		}
 	}
 }
 
-func (d *Dialer) closeExpiredIdleSessions(now time.Time) {
+func (d *Dialer) maintainIdleSessions(now time.Time) {
 	var expired []*session
+	var toProbe []*session
+
+	idleTimeout := d.effectiveIdleTimeout()
+	probeThreshold := d.effectiveIdleProbeThreshold()
+
 	d.idleSessionLock.Lock()
+	if d.closed {
+		d.idleSessionLock.Unlock()
+		return
+	}
 	for seq, s := range d.idleSessions {
-		if s.closed.Load() || s.idleTimedOut(now, idleSessionTimeout) {
+		if s.closed.Load() || s.idleTimedOut(now, idleTimeout) {
 			delete(d.idleSessions, seq)
 			expired = append(expired, s)
+			continue
+		}
+		if s.needsIdleProbe(now, probeThreshold) && s.activeStreams.Load() == 0 && s.state.CompareAndSwap(sessionStateIdle, sessionStateProbing) {
+			delete(d.idleSessions, seq)
+			toProbe = append(toProbe, s)
 		}
 	}
 	d.idleSessionLock.Unlock()
+
 	for _, s := range expired {
 		_ = s.Close()
+	}
+
+	probeTimeout := d.effectiveIdleProbeTimeout()
+	for _, s := range toProbe {
+		if !s.probeIdleHealth(probeTimeout) {
+			_ = s.Close()
+			continue
+		}
+		reclose := false
+		d.idleSessionLock.Lock()
+		if d.closed || s.closed.Load() || d.sessions[s.seq] != s || s.activeStreams.Load() != 0 {
+			reclose = d.closed
+		} else if s.idleTimedOut(time.Now(), idleTimeout) || len(d.idleSessions) >= maxIdleSessions {
+			reclose = true
+		} else if s.state.CompareAndSwap(sessionStateProbing, sessionStateIdle) {
+			d.idleSessions[s.seq] = s
+		}
+		d.idleSessionLock.Unlock()
+		if reclose {
+			_ = s.Close()
+		}
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 const (
 	sessionStateActive uint32 = iota + 1
 	sessionStateIdle
+	sessionStateProbing
 	sessionStateClosing
 	sessionStateClosed
 )
@@ -47,6 +48,7 @@ type session struct {
 	state         atomic.Uint32
 	activeStreams atomic.Int32
 	idleAt        atomic.Int64
+	lastProbeAt   atomic.Int64
 	closed        atomic.Bool
 	done          chan struct{}
 
@@ -155,6 +157,7 @@ func (s *session) removeStream(sid uint32) {
 		return
 	}
 	s.state.Store(sessionStateIdle)
+	s.lastProbeAt.Store(0)
 	s.idleAt.Store(time.Now().UnixNano())
 
 	if s.owner != nil && s.owner.sessionIdle(s) {
@@ -173,6 +176,7 @@ func (s *session) addStream(stream *stream) error {
 	s.activeStreams.Add(1)
 	s.state.Store(sessionStateActive)
 	s.idleAt.Store(0)
+	s.lastProbeAt.Store(0)
 	return nil
 }
 
@@ -359,8 +363,11 @@ func (s *session) needsIdleProbe(now time.Time, threshold time.Duration) bool {
 	if threshold <= 0 {
 		return false
 	}
-	idleAt := s.idleAt.Load()
-	return idleAt > 0 && !now.Before(time.Unix(0, idleAt).Add(threshold))
+	since := s.lastProbeAt.Load()
+	if since == 0 {
+		since = s.idleAt.Load()
+	}
+	return since > 0 && !now.Before(time.Unix(0, since).Add(threshold))
 }
 
 func (s *session) probeIdleHealth(timeout time.Duration) bool {
@@ -379,13 +386,14 @@ func (s *session) probeIdleHealth(timeout time.Duration) bool {
 	}
 
 drained:
-	if _, err := writeFrame(s, newFrame(cmdHeartRequest, 0)); err != nil {
+	if _, err := writeFrameWithDeadline(s, newFrame(cmdHeartRequest, 0), time.Now().Add(timeout)); err != nil {
 		return false
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-s.heartResponseCh:
+		s.lastProbeAt.Store(time.Now().UnixNano())
 		return true
 	case <-s.done:
 		return false

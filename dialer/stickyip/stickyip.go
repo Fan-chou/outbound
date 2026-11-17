@@ -52,10 +52,96 @@ type proxyIpEntry struct {
 	udp4Addr string
 	// udp6Addr is the IPv6:port that works for UDP connections.
 	udp6Addr string
+	// stale*Addr preserve the last confirmed working IP across check cycles
+	// for fallback if DNS resolution fails in a subsequent cycle (StickyIP#8).
+	staleTcp4Addr string
+	staleTcp6Addr string
+	staleUdp4Addr string
+	staleUdp6Addr string
 	// expiresAt is when this cache entry expires.
 	expiresAt time.Time
 	// checkCycle is the health check cycle number this entry belongs to.
 	checkCycle uint64
+}
+
+func (e *proxyIpEntry) getActive(key string) string {
+	switch key {
+	case "tcp4":
+		return e.tcp4Addr
+	case "tcp6":
+		return e.tcp6Addr
+	case "udp4":
+		return e.udp4Addr
+	case "udp6":
+		return e.udp6Addr
+	default:
+		return ""
+	}
+}
+
+func (e *proxyIpEntry) setActive(key, addr string) {
+	switch key {
+	case "tcp4":
+		e.tcp4Addr = addr
+	case "tcp6":
+		e.tcp6Addr = addr
+	case "udp4":
+		e.udp4Addr = addr
+	case "udp6":
+		e.udp6Addr = addr
+	}
+}
+
+func (e *proxyIpEntry) getStale(key string) string {
+	switch key {
+	case "tcp4":
+		return e.staleTcp4Addr
+	case "tcp6":
+		return e.staleTcp6Addr
+	case "udp4":
+		return e.staleUdp4Addr
+	case "udp6":
+		return e.staleUdp6Addr
+	default:
+		return ""
+	}
+}
+
+func (e *proxyIpEntry) setStale(key, addr string) {
+	switch key {
+	case "tcp4":
+		e.staleTcp4Addr = addr
+	case "tcp6":
+		e.staleTcp6Addr = addr
+	case "udp4":
+		e.staleUdp4Addr = addr
+	case "udp6":
+		e.staleUdp6Addr = addr
+	}
+}
+
+func (e *proxyIpEntry) demoteActiveToStale() {
+	if e.tcp4Addr != "" {
+		e.staleTcp4Addr = e.tcp4Addr
+		e.tcp4Addr = ""
+	}
+	if e.tcp6Addr != "" {
+		e.staleTcp6Addr = e.tcp6Addr
+		e.tcp6Addr = ""
+	}
+	if e.udp4Addr != "" {
+		e.staleUdp4Addr = e.udp4Addr
+		e.udp4Addr = ""
+	}
+	if e.udp6Addr != "" {
+		e.staleUdp6Addr = e.udp6Addr
+		e.udp6Addr = ""
+	}
+}
+
+func (e *proxyIpEntry) hasAny() bool {
+	return e.tcp4Addr != "" || e.tcp6Addr != "" || e.udp4Addr != "" || e.udp6Addr != "" ||
+		e.staleTcp4Addr != "" || e.staleTcp6Addr != "" || e.staleUdp4Addr != "" || e.staleUdp6Addr != ""
 }
 
 // cacheKey generates a cache key from network (tcp/udp) and IP version (4/6).
@@ -120,22 +206,19 @@ func (c *ProxyIpCache) Set(originalAddr, actualAddr string, network string, ipVe
 	}
 
 	// Refresh metadata on every successful set so long-lived entries do not
-	// become permanently expired or stuck on an old cycle.
+	// become permanently expired or stuck on an old cycle. If this entry still
+	// held active addresses from an earlier cycle, demote them to stale first so
+	// other protocols/families in the entry are not mistaken for current-cycle hits.
+	if exists && entry.checkCycle != cycle {
+		entry.demoteActiveToStale()
+	}
 	entry.expiresAt = now.Add(CacheTTL)
 	entry.checkCycle = cycle
 
 	// Update the appropriate address based on network type and IP version.
 	key := cacheKey(network, ipVersion)
-	switch key {
-	case "tcp4":
-		entry.tcp4Addr = actualAddr
-	case "tcp6":
-		entry.tcp6Addr = actualAddr
-	case "udp4":
-		entry.udp4Addr = actualAddr
-	case "udp6":
-		entry.udp6Addr = actualAddr
-	}
+	entry.setActive(key, actualAddr)
+	entry.setStale(key, actualAddr)
 
 	if logger.IsLevelEnabled(logrus.DebugLevel) {
 		logger.WithFields(logrus.Fields{
@@ -201,18 +284,8 @@ func (c *ProxyIpCache) GetWithCycleAndIpVersion(proxyAddr string, network string
 	}
 
 	// Return the protocol and IP version specific cached address.
-	var cachedAddr string
 	key := cacheKey(network, ipVersion)
-	switch key {
-	case "tcp4":
-		cachedAddr = entry.tcp4Addr
-	case "tcp6":
-		cachedAddr = entry.tcp6Addr
-	case "udp4":
-		cachedAddr = entry.udp4Addr
-	case "udp6":
-		cachedAddr = entry.udp6Addr
-	}
+	cachedAddr := entry.getActive(key)
 	c.RUnlock()
 
 	if cachedAddr == "" {
@@ -271,19 +344,11 @@ func (c *ProxyIpCache) InvalidateProtocolAndIpVersion(proxyAddr, network, ipVers
 	}
 
 	key := cacheKey(network, ipVersion)
-	switch key {
-	case "tcp4":
-		entry.tcp4Addr = ""
-	case "tcp6":
-		entry.tcp6Addr = ""
-	case "udp4":
-		entry.udp4Addr = ""
-	case "udp6":
-		entry.udp6Addr = ""
-	}
+	entry.setActive(key, "")
+	entry.setStale(key, "")
 
-	// If all addresses are empty now, remove the entry entirely
-	if entry.tcp4Addr == "" && entry.tcp6Addr == "" && entry.udp4Addr == "" && entry.udp6Addr == "" {
+	// If all addresses (active and stale) are empty now, remove the entry entirely.
+	if !entry.hasAny() {
 		delete(c.cache, proxyAddr)
 	} else {
 		logger.WithFields(logrus.Fields{
@@ -310,11 +375,59 @@ func (c *ProxyIpCache) invalidateProxyCycle(proxyAddr string, cycle uint64) {
 	if c == nil {
 		return
 	}
+	now := time.Now()
 	c.Lock()
 	defer c.Unlock()
-	if entry := c.cache[proxyAddr]; entry != nil && entry.checkCycle == cycle {
+	entry := c.cache[proxyAddr]
+	if entry == nil || entry.checkCycle != cycle {
+		return
+	}
+	if now.After(entry.expiresAt) {
+		delete(c.cache, proxyAddr)
+		return
+	}
+	// Preserve the last confirmed working IP as stale fallback in case DNS
+	// re-resolution fails on the next check cycle (StickyIP#8).
+	entry.demoteActiveToStale()
+	if !entry.hasAny() {
 		delete(c.cache, proxyAddr)
 	}
+}
+
+func (c *ProxyIpCache) getStaleCandidates(proxyAddr, targetAddr, baseNetwork, requestedIPVersion string) []dialCandidate {
+	if c == nil {
+		return nil
+	}
+	now := time.Now()
+	c.RLock()
+	entry, ok := c.cache[proxyAddr]
+	if !ok {
+		c.RUnlock()
+		return nil
+	}
+	if now.After(entry.expiresAt) {
+		c.RUnlock()
+		c.deleteIfExpired(proxyAddr, now)
+		return nil
+	}
+	var versions []string
+	switch requestedIPVersion {
+	case "4", "6":
+		versions = []string{requestedIPVersion}
+	default:
+		versions = []string{"4", "6"}
+	}
+	var out []dialCandidate
+	for _, ver := range versions {
+		if staleAddr := entry.getStale(cacheKey(baseNetwork, ver)); staleAddr != "" {
+			out = append(out, dialCandidate{
+				targetAddr: rewriteAddrPort(staleAddr, targetAddr),
+				ipVersion:  ver,
+			})
+		}
+	}
+	c.RUnlock()
+	return out
 }
 
 // StickyIpDialer wraps a dialer to provide sticky IP caching for proxy servers.
@@ -516,7 +629,15 @@ const (
 	// first attempt so aggressively that a merely slow-but-working IP is never
 	// given a fair chance to connect.
 	stickyFallbackReservePerAttempt = 750 * time.Millisecond
+	// stickyRaceHeadStartDelay gives the preferred candidate a Happy-Eyeballs
+	// style exclusive window before concurrently racing remaining candidates.
+	stickyRaceHeadStartDelay = 250 * time.Millisecond
 )
+
+type dialCandidate struct {
+	targetAddr string
+	ipVersion  string
+}
 
 func dialAttemptContext(ctx context.Context, attemptsRemaining int) (context.Context, context.CancelFunc) {
 	if attemptsRemaining < 1 {
@@ -613,7 +734,22 @@ func (d *StickyIpDialer) dialWithIpResolution(ctx context.Context, network, addr
 		if isCanceledOrClosed(err) {
 			return nil, err
 		}
-		// Resolution failed, try original address
+		if staleCandidates := d.cache.getStaleCandidates(d.proxyAddr, addr, baseNetwork, requestedIPVersion); len(staleCandidates) > 0 {
+			logResolutionFallbackStale(d.proxyAddr, host, err, len(staleCandidates))
+			conn, staleErr := d.dialCandidates(ctx, network, baseNetwork, staleCandidates)
+			if staleErr == nil {
+				return conn, nil
+			}
+			if isCanceledOrClosed(staleErr) {
+				return nil, staleErr
+			}
+			for _, cand := range staleCandidates {
+				d.cache.InvalidateProtocolAndIpVersion(d.proxyAddr, baseNetwork, cand.ipVersion)
+			}
+			logAllIPsFailed(d.proxyAddr, staleErr)
+			return nil, &net.OpError{Op: "dial", Err: staleErr}
+		}
+		// No stale confirmed IP available; fall back to original address.
 		logResolutionError(d.proxyAddr, host, err)
 		return d.dialer.DialContext(ctx, network, addr)
 	}
@@ -625,53 +761,228 @@ func (d *StickyIpDialer) dialWithIpResolution(ctx context.Context, network, addr
 	// Log all resolved IPs
 	logResolvedIPs(d.proxyAddr, ips, port, network)
 
-	// Try each IP until one works
-	var lastErr error
-	for i, ipAddr := range ips {
+	candidates := make([]dialCandidate, 0, len(ips))
+	for _, ipAddr := range ips {
 		if ipAddr.IP == nil {
 			continue
 		}
-		ipAddrStr := ipAddr.IP.String()
-		targetAddr := net.JoinHostPort(ipAddrStr, port)
-
-		logTryingIP(d.proxyAddr, targetAddr, network)
-		attemptCtx, cancel := dialAttemptContext(ctx, len(ips)-i)
-		conn, err := d.dialer.DialContext(attemptCtx, network, targetAddr)
-		cancel()
-		if err == nil {
-			if baseNetwork == "udp" {
-				_, ok := conn.(netproxy.PacketConn)
-				if !ok {
-					_ = conn.Close()
-					lastErr = fmt.Errorf("not a packet connection")
-					logIPFailure(d.proxyAddr, targetAddr, lastErr)
-					continue
-				}
-			}
-			// This IP works for this protocol, cache it
-			// Determine IP version from the successful IP
-			ipVersion := "4"
-			if ipAddr.IP.To4() == nil {
-				ipVersion = "6"
-			}
-			cycle := d.checkCycle.Load()
-			d.cache.Set(d.proxyAddr, targetAddr, baseNetwork, ipVersion, cycle)
-			logIPSuccess(d.proxyAddr, targetAddr, baseNetwork, ipVersion, cycle)
-			return conn, nil
+		ipVersion := "4"
+		if ipAddr.IP.To4() == nil {
+			ipVersion = "6"
 		}
-		lastErr = err
-		if isCanceledOrClosed(err) {
-			return nil, err
-		}
-		logIPFailure(d.proxyAddr, targetAddr, err)
+		candidates = append(candidates, dialCandidate{
+			targetAddr: net.JoinHostPort(ipAddr.IP.String(), port),
+			ipVersion:  ipVersion,
+		})
+	}
+	if len(candidates) == 0 {
+		logAllIPsFailed(d.proxyAddr, errNoUsableProxyIPs)
+		return nil, &net.OpError{Op: "dial", Err: errNoUsableProxyIPs}
 	}
 
-	// All IPs failed, return an error
+	conn, dialErr := d.dialCandidates(ctx, network, baseNetwork, candidates)
+	if dialErr != nil {
+		if isCanceledOrClosed(dialErr) {
+			return nil, dialErr
+		}
+		logAllIPsFailed(d.proxyAddr, dialErr)
+		return nil, &net.OpError{Op: "dial", Err: dialErr}
+	}
+	return conn, nil
+}
+
+func (d *StickyIpDialer) dialCandidate(ctx context.Context, network, baseNetwork string, cand dialCandidate) (netproxy.Conn, error) {
+	logTryingIP(d.proxyAddr, cand.targetAddr, network)
+	conn, err := d.dialer.DialContext(ctx, network, cand.targetAddr)
+	if err != nil {
+		if !isCanceledOrClosed(err) {
+			logIPFailure(d.proxyAddr, cand.targetAddr, err)
+		}
+		return nil, err
+	}
+	if conn == nil {
+		return nil, errNoUsableProxyIPs
+	}
+	if baseNetwork == "udp" {
+		if _, ok := conn.(netproxy.PacketConn); !ok {
+			_ = conn.Close()
+			pktErr := fmt.Errorf("not a packet connection")
+			logIPFailure(d.proxyAddr, cand.targetAddr, pktErr)
+			return nil, pktErr
+		}
+	}
+	return conn, nil
+}
+
+func (d *StickyIpDialer) recordSuccessfulCandidate(baseNetwork string, cand dialCandidate) {
+	cycle := d.checkCycle.Load()
+	d.cache.Set(d.proxyAddr, cand.targetAddr, baseNetwork, cand.ipVersion, cycle)
+	logIPSuccess(d.proxyAddr, cand.targetAddr, baseNetwork, cand.ipVersion, cycle)
+}
+
+// dialCandidates dials candidates using a staggered race: candidate[0] gets a
+// ~250ms head-start window before remaining candidates are launched concurrently.
+// The first successful connection wins, is cached, and all remaining dials are canceled.
+func (d *StickyIpDialer) dialCandidates(ctx context.Context, network, baseNetwork string, candidates []dialCandidate) (netproxy.Conn, error) {
+	if len(candidates) == 0 {
+		return nil, errNoUsableProxyIPs
+	}
+	if len(candidates) == 1 {
+		attemptCtx, cancel := dialAttemptContext(ctx, 1)
+		conn, err := d.dialCandidate(attemptCtx, network, baseNetwork, candidates[0])
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		d.recordSuccessfulCandidate(baseNetwork, candidates[0])
+		return conn, nil
+	}
+
+	var parentCtx context.Context
+	var parentCancel context.CancelFunc
+	if ctx == nil {
+		parentCtx, parentCancel = netproxy.NewDialTimeoutContext()
+	} else if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		parentCtx, parentCancel = context.WithCancel(ctx)
+	} else {
+		parentCtx, parentCancel = netproxy.NewDialTimeoutContextFrom(ctx)
+	}
+	defer parentCancel()
+
+	raceCtx, raceCancel := context.WithCancel(parentCtx)
+	defer raceCancel()
+
+	headStart := stickyRaceHeadStartDelay
+	if deadline, ok := raceCtx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			headStart = 0
+		} else if remaining/2 < headStart {
+			headStart = remaining / 2
+		}
+	}
+
+	type raceWin struct {
+		cand dialCandidate
+		conn netproxy.Conn
+	}
+	var (
+		outcomeMu   sync.Mutex
+		outcomeDone bool
+	)
+	winCh := make(chan raceWin, 1)
+	errCh := make(chan error, len(candidates))
+
+	launch := func(cand dialCandidate) {
+		go func() {
+			conn, err := d.dialCandidate(raceCtx, network, baseNetwork, cand)
+			if err == nil {
+				outcomeMu.Lock()
+				if outcomeDone {
+					outcomeMu.Unlock()
+					_ = conn.Close()
+					return
+				}
+				outcomeDone = true
+				outcomeMu.Unlock()
+				raceCancel()
+				winCh <- raceWin{cand: cand, conn: conn}
+				return
+			}
+			errCh <- err
+		}()
+	}
+
+	launched := 1
+	launch(candidates[0])
+
+	var headStartTimer *time.Timer
+	var headStartCh <-chan time.Time
+	launchRest := func() {
+		if headStartTimer != nil {
+			headStartTimer.Stop()
+			headStartCh = nil
+		}
+		for i := launched; i < len(candidates); i++ {
+			launch(candidates[i])
+		}
+		launched = len(candidates)
+	}
+	if headStart > 0 {
+		headStartTimer = time.NewTimer(headStart)
+		defer headStartTimer.Stop()
+		headStartCh = headStartTimer.C
+	} else {
+		launchRest()
+	}
+
+	remaining := len(candidates)
+	var lastErr error
+	for remaining > 0 {
+		// Prioritize an already-completed winner before reacting to errors or timeouts.
+		select {
+		case win := <-winCh:
+			d.recordSuccessfulCandidate(baseNetwork, win.cand)
+			return win.conn, nil
+		default:
+		}
+
+		select {
+		case win := <-winCh:
+			d.recordSuccessfulCandidate(baseNetwork, win.cand)
+			return win.conn, nil
+		case err := <-errCh:
+			remaining--
+			lastErr = err
+			if isCanceledOrClosed(err) {
+				outcomeMu.Lock()
+				alreadyDone := outcomeDone
+				if !alreadyDone {
+					outcomeDone = true
+				}
+				outcomeMu.Unlock()
+				if alreadyDone {
+					win := <-winCh
+					d.recordSuccessfulCandidate(baseNetwork, win.cand)
+					return win.conn, nil
+				}
+				raceCancel()
+				return nil, err
+			}
+			if launched < len(candidates) {
+				launchRest()
+			}
+		case <-headStartCh:
+			select {
+			case win := <-winCh:
+				d.recordSuccessfulCandidate(baseNetwork, win.cand)
+				return win.conn, nil
+			default:
+				launchRest()
+			}
+		case <-raceCtx.Done():
+			outcomeMu.Lock()
+			alreadyDone := outcomeDone
+			if !alreadyDone {
+				outcomeDone = true
+			}
+			outcomeMu.Unlock()
+			if alreadyDone {
+				win := <-winCh
+				d.recordSuccessfulCandidate(baseNetwork, win.cand)
+				return win.conn, nil
+			}
+			if stderrors.Is(raceCtx.Err(), context.Canceled) || lastErr == nil {
+				return nil, raceCtx.Err()
+			}
+			return nil, lastErr
+		}
+	}
+
 	if lastErr == nil {
 		lastErr = errNoUsableProxyIPs
 	}
-	logAllIPsFailed(d.proxyAddr, lastErr)
-	return nil, &net.OpError{Op: "dial", Err: lastErr}
+	return nil, lastErr
 }
 
 func filterIPAddrsByVersion(ips []net.IPAddr, ipVersion string) []net.IPAddr {
@@ -766,6 +1077,20 @@ func logResolutionError(proxyAddr, host string, err error) {
 			fields["error"] = err.Error()
 		}
 		logger.WithFields(fields).Debug("[StickyIP] DNS resolution failed (will use original domain)")
+	}
+}
+
+func logResolutionFallbackStale(proxyAddr, host string, err error, count int) {
+	if logger.IsLevelEnabled(logrus.DebugLevel) {
+		fields := logrus.Fields{
+			"proxy_addr":       proxyAddr,
+			"host":             host,
+			"stale_candidates": count,
+		}
+		if err != nil {
+			fields["error"] = err.Error()
+		}
+		logger.WithFields(fields).Debug("[StickyIP] DNS resolution failed (retrying last confirmed proxy IP)")
 	}
 }
 

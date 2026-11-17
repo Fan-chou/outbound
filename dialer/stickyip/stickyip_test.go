@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -547,4 +548,300 @@ func TestStickyIpDialerResolvedProxyCancellationStopsFallback(t *testing.T) {
 	if got, want := parent.dialCalls[0][1], "203.0.113.10:443"; got != want {
 		t.Fatalf("DialContext() addr = %q, want %q", got, want)
 	}
+}
+
+type closeCountingConn struct {
+	nopConn
+	id     string
+	closed atomic.Bool
+}
+
+func (c *closeCountingConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func TestStickyIpDialerStaleFallbackAfterIncrementCheckCycle(t *testing.T) {
+	t.Run("uses last confirmed IP when re-resolution fails", func(t *testing.T) {
+		parent := &recordingLookupDialer{
+			lookupResult: []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}},
+			conn:         nopConn{},
+		}
+		dialer := NewStickyIpDialer(parent, "proxy.example:443,8443", NewProxyIpCache())
+
+		if _, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443"); err != nil {
+			t.Fatalf("cycle 0 DialContext() error = %v", err)
+		}
+
+		dialer.IncrementCheckCycle()
+		if got := dialer.GetCachedProxyAddr("tcp"); got != "proxy.example:443,8443" {
+			t.Fatalf("GetCachedProxyAddr() after cycle increment = %q, want cache miss", got)
+		}
+
+		parent.mu.Lock()
+		parent.lookupErr = stderrors.New("dns timeout")
+		parent.dialCalls = nil
+		parent.mu.Unlock()
+
+		conn, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:8443")
+		if err != nil {
+			t.Fatalf("cycle 1 DialContext() with DNS error = %v", err)
+		}
+		if conn == nil {
+			t.Fatal("expected non-nil conn from stale fallback")
+		}
+
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+		if len(parent.dialCalls) != 1 {
+			t.Fatalf("DialContext() calls = %d, want 1", len(parent.dialCalls))
+		}
+		if got, want := parent.dialCalls[0][1], "203.0.113.10:8443"; got != want {
+			t.Fatalf("stale fallback dial addr = %q, want %q (must not fall back to unresolved domain)", got, want)
+		}
+		if got := dialer.GetCachedProxyAddr("tcp"); got != "203.0.113.10:8443" {
+			t.Fatalf("GetCachedProxyAddr() after stale recovery = %q, want promoted to current cycle", got)
+		}
+	})
+
+	t.Run("does not retry stale IP on context cancellation", func(t *testing.T) {
+		parent := &recordingLookupDialer{
+			lookupResult: []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}},
+			conn:         nopConn{},
+		}
+		dialer := NewStickyIpDialer(parent, "proxy.example:443", NewProxyIpCache())
+		if _, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443"); err != nil {
+			t.Fatalf("initial dial error = %v", err)
+		}
+
+		dialer.IncrementCheckCycle()
+		parent.mu.Lock()
+		parent.lookupErr = context.Canceled
+		parent.dialCalls = nil
+		parent.mu.Unlock()
+
+		_, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443")
+		if !stderrors.Is(err, context.Canceled) {
+			t.Fatalf("DialContext() err = %v, want context.Canceled", err)
+		}
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+		if len(parent.dialCalls) != 0 {
+			t.Fatalf("DialContext() calls = %d, want 0 on canceled lookup", len(parent.dialCalls))
+		}
+	})
+
+	t.Run("stale failure invalidates stale entry without dialing unresolved domain", func(t *testing.T) {
+		parent := &recordingLookupDialer{
+			lookupResult: []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}},
+			conn:         nopConn{},
+		}
+		dialer := NewStickyIpDialer(parent, "proxy.example:443", NewProxyIpCache())
+		if _, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443"); err != nil {
+			t.Fatalf("initial dial error = %v", err)
+		}
+
+		dialer.IncrementCheckCycle()
+		parent.mu.Lock()
+		parent.lookupErr = stderrors.New("dns down")
+		parent.dialErr = stderrors.New("connection refused")
+		parent.dialCalls = nil
+		parent.mu.Unlock()
+
+		if _, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443"); err == nil {
+			t.Fatal("expected error when both DNS and stale IP fail")
+		}
+
+		parent.mu.Lock()
+		if len(parent.dialCalls) != 1 || parent.dialCalls[0][1] != "203.0.113.10:443" {
+			t.Fatalf("dialCalls = %+v, want single stale IP attempt without unresolved domain fallback", parent.dialCalls)
+		}
+		parent.mu.Unlock()
+
+		if stale := dialer.cache.getStaleCandidates("proxy.example:443", "proxy.example:443", "tcp", ""); len(stale) != 0 {
+			t.Fatalf("expected failed stale entry to be invalidated, got %+v", stale)
+		}
+	})
+
+	t.Run("cross-protocol cycle isolation", func(t *testing.T) {
+		cache := NewProxyIpCache()
+		cache.Set("proxy.example:443", "203.0.113.10:443", "tcp", "4", 0)
+		cache.Set("proxy.example:443", "203.0.113.10:443", "udp", "4", 0)
+
+		// Advancing to cycle 1 and setting tcp4 must not promote cycle-0 udp4 to cycle 1.
+		cache.Set("proxy.example:443", "203.0.113.11:443", "tcp", "4", 1)
+		if got := cache.GetWithCycleAndIpVersion("proxy.example:443", "udp", "4", 1); got != "proxy.example:443" {
+			t.Fatalf("udp4 leaked across cycles: got %q, want miss", got)
+		}
+		if stale := cache.getStaleCandidates("proxy.example:443", "proxy.example:443", "udp", "4"); len(stale) != 1 || stale[0].targetAddr != "203.0.113.10:443" {
+			t.Fatalf("udp4 stale = %+v, want 203.0.113.10:443", stale)
+		}
+	})
+}
+
+func TestStickyIpDialerStaggeredRace(t *testing.T) {
+	t.Run("primary head start avoids extra dials when fast", func(t *testing.T) {
+		parent := &recordingLookupDialer{
+			lookupResult: []net.IPAddr{
+				{IP: net.ParseIP("198.51.100.10")},
+				{IP: net.ParseIP("198.51.100.20")},
+				{IP: net.ParseIP("198.51.100.30")},
+			},
+			conn: nopConn{},
+		}
+		dialer := NewStickyIpDialer(parent, "proxy.example:443", NewProxyIpCache())
+		conn, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443")
+		if err != nil {
+			t.Fatalf("DialContext() error = %v", err)
+		}
+		if conn == nil {
+			t.Fatal("expected non-nil conn")
+		}
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+		if len(parent.dialCalls) != 1 || parent.dialCalls[0][1] != "198.51.100.10:443" {
+			t.Fatalf("dialCalls = %+v, want only primary IP dialed", parent.dialCalls)
+		}
+	})
+
+	t.Run("staggered race launches remaining after head start and cancels losers", func(t *testing.T) {
+		var mu sync.Mutex
+		startedAt := make(map[string]time.Time)
+		canceled := make(map[string]chan struct{})
+		for _, ip := range []string{"198.51.100.10:443", "198.51.100.20:443", "198.51.100.30:443"} {
+			canceled[ip] = make(chan struct{})
+		}
+		winConn := &closeCountingConn{id: "winner"}
+
+		parent := &recordingLookupDialer{
+			lookupResult: []net.IPAddr{
+				{IP: net.ParseIP("198.51.100.10")},
+				{IP: net.ParseIP("198.51.100.20")},
+				{IP: net.ParseIP("198.51.100.30")},
+			},
+		}
+		parent.dialContextFunc = func(ctx context.Context, _ string, addr string) (netproxy.Conn, error) {
+			mu.Lock()
+			startedAt[addr] = time.Now()
+			mu.Unlock()
+
+			switch addr {
+			case "198.51.100.10:443":
+				<-ctx.Done()
+				close(canceled[addr])
+				return nil, ctx.Err()
+			case "198.51.100.20:443":
+				<-ctx.Done()
+				close(canceled[addr])
+				return nil, ctx.Err()
+			case "198.51.100.30:443":
+				return winConn, nil
+			default:
+				return nil, stderrors.New("unexpected addr")
+			}
+		}
+
+		dialer := NewStickyIpDialer(parent, "proxy.example:443", NewProxyIpCache())
+		conn, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443")
+		if err != nil {
+			t.Fatalf("DialContext() error = %v", err)
+		}
+		if conn != winConn {
+			t.Fatalf("DialContext() returned %#v, want winConn", conn)
+		}
+		if winConn.closed.Load() {
+			t.Fatal("winning conn was closed")
+		}
+		if got := dialer.GetCachedProxyAddr("tcp"); got != "198.51.100.30:443" {
+			t.Fatalf("cached winner = %q, want 198.51.100.30:443", got)
+		}
+
+		for _, loser := range []string{"198.51.100.10:443", "198.51.100.20:443"} {
+			select {
+			case <-canceled[loser]:
+			case <-time.After(time.Second):
+				t.Fatalf("loser %s was not canceled promptly", loser)
+			}
+		}
+
+		mu.Lock()
+		delay := startedAt["198.51.100.30:443"].Sub(startedAt["198.51.100.10:443"])
+		mu.Unlock()
+		if delay < 200*time.Millisecond {
+			t.Fatalf("secondary launch delay = %v, want ~250ms head start", delay)
+		}
+	})
+
+	t.Run("early primary failure launches remaining immediately without waiting 250ms", func(t *testing.T) {
+		parent := &recordingLookupDialer{
+			lookupResult: []net.IPAddr{
+				{IP: net.ParseIP("198.51.100.10")},
+				{IP: net.ParseIP("198.51.100.20")},
+			},
+		}
+		parent.dialContextFunc = func(_ context.Context, _ string, addr string) (netproxy.Conn, error) {
+			if addr == "198.51.100.10:443" {
+				return nil, stderrors.New("connection refused")
+			}
+			return nopConn{}, nil
+		}
+
+		dialer := NewStickyIpDialer(parent, "proxy.example:443", NewProxyIpCache())
+		start := time.Now()
+		conn, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443")
+		elapsed := time.Since(start)
+		if err != nil || conn == nil {
+			t.Fatalf("DialContext() = (%v, %v), want success", conn, err)
+		}
+		if elapsed >= 150*time.Millisecond {
+			t.Fatalf("DialContext() took %v after immediate primary failure, want < 150ms", elapsed)
+		}
+	})
+
+	t.Run("simultaneous winner closes losing conn without leak", func(t *testing.T) {
+		conn1 := &closeCountingConn{id: "c1"}
+		conn2 := &closeCountingConn{id: "c2"}
+		parent := &recordingLookupDialer{
+			lookupResult: []net.IPAddr{
+				{IP: net.ParseIP("198.51.100.10")},
+				{IP: net.ParseIP("198.51.100.20")},
+			},
+		}
+		ready := make(chan struct{})
+		var gate sync.Once
+		parent.dialContextFunc = func(_ context.Context, _ string, addr string) (netproxy.Conn, error) {
+			if addr == "198.51.100.10:443" {
+				<-ready
+				return conn1, nil
+			}
+			gate.Do(func() { close(ready) })
+			return conn2, nil
+		}
+
+		dialer := NewStickyIpDialer(parent, "proxy.example:443", NewProxyIpCache())
+		winner, err := dialer.DialContext(context.Background(), "tcp", "proxy.example:443")
+		if err != nil {
+			t.Fatalf("DialContext() error = %v", err)
+		}
+
+		// Wait briefly for the concurrent loser to observe outcomeDone and close.
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if conn1.closed.Load() != conn2.closed.Load() {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if winner == conn1 {
+			if conn1.closed.Load() || !conn2.closed.Load() {
+				t.Fatalf("expected conn1 open (%v) and conn2 closed (%v)", conn1.closed.Load(), conn2.closed.Load())
+			}
+		} else if winner == conn2 {
+			if conn2.closed.Load() || !conn1.closed.Load() {
+				t.Fatalf("expected conn2 open (%v) and conn1 closed (%v)", conn2.closed.Load(), conn1.closed.Load())
+			}
+		} else {
+			t.Fatalf("unexpected winner %#v", winner)
+		}
+	})
 }

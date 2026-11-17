@@ -110,16 +110,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 	serverAddr := quicRemoteAddr(pktConn, c.config.ServerAddr)
 	// Convert config to TLS config & QUIC config
 	tlsConfig := c.config.TLSConfig.toTLSConfig()
-	quicConfig := &quic.Config{
-		InitialStreamReceiveWindow:     c.config.QUICConfig.InitialStreamReceiveWindow,
-		MaxStreamReceiveWindow:         c.config.QUICConfig.MaxStreamReceiveWindow,
-		InitialConnectionReceiveWindow: c.config.QUICConfig.InitialConnectionReceiveWindow,
-		MaxConnectionReceiveWindow:     c.config.QUICConfig.MaxConnectionReceiveWindow,
-		MaxIdleTimeout:                 c.config.QUICConfig.MaxIdleTimeout,
-		KeepAlivePeriod:                c.config.QUICConfig.KeepAlivePeriod,
-		DisablePathMTUDiscovery:        c.config.QUICConfig.DisablePathMTUDiscovery,
-		EnableDatagrams:                true,
-	}
+	quicConfig := buildQUICConfig(c.config)
 	// Prepare Transport
 	var conn quic.EarlyConnection
 	rt := &http3.Transport{
@@ -195,6 +186,27 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 		UDPEnabled: authResp.UDPEnabled,
 		Tx:         actualTx,
 	}, nil
+}
+
+func buildQUICConfig(cfg *Config) *quic.Config {
+	initialPacketSize := cfg.QUICConfig.InitialPacketSize
+	if initialPacketSize == 0 && cfg.ObfsPassword != "" {
+		// Salamander adds an 8-byte header on top of QUIC UDP payloads; clamp
+		// default initial packets so encapsulated frames stay under a 1280-byte
+		// WireGuard MTU when Path MTU Discovery or probes hit low-MTU paths.
+		initialPacketSize = defaultObfsInitialPacketSize
+	}
+	return &quic.Config{
+		InitialStreamReceiveWindow:     cfg.QUICConfig.InitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         cfg.QUICConfig.MaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: cfg.QUICConfig.InitialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     cfg.QUICConfig.MaxConnectionReceiveWindow,
+		MaxIdleTimeout:                 cfg.QUICConfig.MaxIdleTimeout,
+		KeepAlivePeriod:                cfg.QUICConfig.KeepAlivePeriod,
+		InitialPacketSize:              initialPacketSize,
+		DisablePathMTUDiscovery:        cfg.QUICConfig.DisablePathMTUDiscovery,
+		EnableDatagrams:                true,
+	}
 }
 
 func quicRemoteAddr(pktConn net.PacketConn, fallback net.Addr) net.Addr {

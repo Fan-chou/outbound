@@ -226,3 +226,73 @@ func TestExportToURLDistinguishesObfsPassword(t *testing.T) {
 		t.Fatalf("nodes that differ only in obfs-password exported identical URL %q", one.ExportToURL())
 	}
 }
+
+func TestParseHysteria2URLQUICWindowAndMTUParams(t *testing.T) {
+	t.Run("canonical params round trip", func(t *testing.T) {
+		link := "hysteria2://user:pass@example.com:443?init_stream_receive_window=4194304&max_stream_receive_window=16777216&init_conn_receive_window=33554432&max_conn_receive_window=134217728&disable_mtu_discovery=1#demo"
+		conf, err := ParseHysteria2URL(link)
+		if err != nil {
+			t.Fatalf("ParseHysteria2URL() error = %v", err)
+		}
+		if conf.InitStreamReceiveWindow != 4194304 ||
+			conf.MaxStreamReceiveWindow != 16777216 ||
+			conf.InitConnReceiveWindow != 33554432 ||
+			conf.MaxConnReceiveWindow != 134217728 ||
+			!conf.DisablePathMTUDiscovery {
+			t.Fatalf("parsed config mismatch: %+v", conf)
+		}
+
+		roundTrip, err := ParseHysteria2URL(conf.ExportToURL())
+		if err != nil {
+			t.Fatalf("round-trip ParseHysteria2URL() error = %v", err)
+		}
+		if roundTrip.InitStreamReceiveWindow != conf.InitStreamReceiveWindow ||
+			roundTrip.MaxStreamReceiveWindow != conf.MaxStreamReceiveWindow ||
+			roundTrip.InitConnReceiveWindow != conf.InitConnReceiveWindow ||
+			roundTrip.MaxConnReceiveWindow != conf.MaxConnReceiveWindow ||
+			roundTrip.DisablePathMTUDiscovery != conf.DisablePathMTUDiscovery {
+			t.Fatalf("round-trip mismatch: got %+v, want %+v", roundTrip, conf)
+		}
+
+		d, prop, err := conf.Dialer(&dialer.ExtraOption{}, &noopDialer{})
+		if err != nil {
+			t.Fatalf("Dialer() error = %v", err)
+		}
+		if closer, ok := d.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		if prop == nil || !strings.Contains(prop.Link, "disable_mtu_discovery=1") {
+			t.Fatalf("property.Link = %v, want disable_mtu_discovery=1", prop)
+		}
+	})
+
+	t.Run("alias params stream_receive_window and conn_receive_window", func(t *testing.T) {
+		link := "hy2://user:pass@example.com:443?stream_receive_window=8388608&conn_receive_window=67108864&disable_mtu_discovery=true"
+		conf, err := ParseHysteria2URL(link)
+		if err != nil {
+			t.Fatalf("ParseHysteria2URL() error = %v", err)
+		}
+		if conf.MaxStreamReceiveWindow != 8388608 {
+			t.Fatalf("MaxStreamReceiveWindow = %d, want 8388608", conf.MaxStreamReceiveWindow)
+		}
+		if conf.MaxConnReceiveWindow != 67108864 {
+			t.Fatalf("MaxConnReceiveWindow = %d, want 67108864", conf.MaxConnReceiveWindow)
+		}
+		if !conf.DisablePathMTUDiscovery {
+			t.Fatal("DisablePathMTUDiscovery = false, want true")
+		}
+	})
+
+	t.Run("invalid values rejected", func(t *testing.T) {
+		for _, bad := range []string{
+			"hysteria2://u:p@example.com:443?init_stream_receive_window=abc",
+			"hysteria2://u:p@example.com:443?stream_receive_window=-1",
+			"hysteria2://u:p@example.com:443?max_conn_receive_window=10m",
+			"hysteria2://u:p@example.com:443?disable_mtu_discovery=maybe",
+		} {
+			if _, err := ParseHysteria2URL(bad); err == nil {
+				t.Fatalf("ParseHysteria2URL(%q) unexpectedly succeeded", bad)
+			}
+		}
+	})
+}

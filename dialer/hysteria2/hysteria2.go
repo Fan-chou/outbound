@@ -26,18 +26,23 @@ func init() {
 }
 
 type Hysteria2 struct {
-	Name          string
-	User          string
-	Password      string
-	Server        string
-	Insecure      bool
-	Sni           string
-	PinSHA256     string
-	CA            string
-	ECHConfigList []byte
-	MaxTx         uint64
-	MaxRx         uint64
-	ObfsPassword  string
+	Name                    string
+	User                    string
+	Password                string
+	Server                  string
+	Insecure                bool
+	Sni                     string
+	PinSHA256               string
+	CA                      string
+	ECHConfigList           []byte
+	MaxTx                   uint64
+	MaxRx                   uint64
+	ObfsPassword            string
+	InitStreamReceiveWindow uint64
+	MaxStreamReceiveWindow  uint64
+	InitConnReceiveWindow   uint64
+	MaxConnReceiveWindow    uint64
+	DisablePathMTUDiscovery bool
 }
 
 func NewHysteria2(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
@@ -76,8 +81,13 @@ func (s *Hysteria2) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Diale
 	}
 
 	feature1 := &hysteria2.Feature1{
-		UDPHopInterval: option.UDPHopInterval,
-		ObfsPassword:   s.ObfsPassword,
+		UDPHopInterval:          option.UDPHopInterval,
+		ObfsPassword:            s.ObfsPassword,
+		InitStreamReceiveWindow: s.InitStreamReceiveWindow,
+		MaxStreamReceiveWindow:  s.MaxStreamReceiveWindow,
+		InitConnReceiveWindow:   s.InitConnReceiveWindow,
+		MaxConnReceiveWindow:    s.MaxConnReceiveWindow,
+		DisablePathMTUDiscovery: s.DisablePathMTUDiscovery,
 	}
 	if s.MaxTx > 0 && s.MaxRx > 0 {
 		feature1.BandwidthConfig = client.BandwidthConfig{
@@ -221,21 +231,69 @@ func ParseHysteria2URL(link string) (*Hysteria2, error) {
 			return nil, fmt.Errorf("%w: ech: %w", dialer.InvalidParameterErr, err)
 		}
 	}
+	initStreamReceiveWindow, err := parseUint64QueryParam(q, "init_stream_receive_window")
+	if err != nil {
+		return nil, err
+	}
+	maxStreamReceiveWindow, err := parseUint64QueryParam(q, "max_stream_receive_window", "stream_receive_window")
+	if err != nil {
+		return nil, err
+	}
+	initConnReceiveWindow, err := parseUint64QueryParam(q, "init_conn_receive_window")
+	if err != nil {
+		return nil, err
+	}
+	maxConnReceiveWindow, err := parseUint64QueryParam(q, "max_conn_receive_window", "conn_receive_window")
+	if err != nil {
+		return nil, err
+	}
+	var disableMTUDiscovery bool
+	if rawDisableMTU := q.Get("disable_mtu_discovery"); rawDisableMTU != "" {
+		disableMTUDiscovery, err = strconv.ParseBool(rawDisableMTU)
+		if err != nil {
+			return nil, fmt.Errorf("%w: disable_mtu_discovery: %w", dialer.InvalidParameterErr, err)
+		}
+	}
 	conf := &Hysteria2{
-		Name:          u.Fragment,
-		User:          u.User.Username(),
-		Server:        u.Host,
-		Insecure:      insecure,
-		Sni:           q.Get("sni"),
-		PinSHA256:     q.Get("pinSHA256"),
-		CA:            q.Get("ca"),
-		ECHConfigList: echConfigList,
-		MaxTx:         maxTx,
-		MaxRx:         maxRx,
-		ObfsPassword:  obfsPassword,
+		Name:                    u.Fragment,
+		User:                    u.User.Username(),
+		Server:                  u.Host,
+		Insecure:                insecure,
+		Sni:                     q.Get("sni"),
+		PinSHA256:               q.Get("pinSHA256"),
+		CA:                      q.Get("ca"),
+		ECHConfigList:           echConfigList,
+		MaxTx:                   maxTx,
+		MaxRx:                   maxRx,
+		ObfsPassword:            obfsPassword,
+		InitStreamReceiveWindow: initStreamReceiveWindow,
+		MaxStreamReceiveWindow:  maxStreamReceiveWindow,
+		InitConnReceiveWindow:   initConnReceiveWindow,
+		MaxConnReceiveWindow:    maxConnReceiveWindow,
+		DisablePathMTUDiscovery: disableMTUDiscovery,
 	}
 	conf.Password, _ = u.User.Password()
 	return conf, nil
+}
+
+func parseUint64QueryParam(q url.Values, keys ...string) (uint64, error) {
+	var parsed uint64
+	var hasValue bool
+	for _, key := range keys {
+		raw := q.Get(key)
+		if raw == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s: %w", dialer.InvalidParameterErr, key, err)
+		}
+		if !hasValue {
+			parsed = v
+			hasValue = true
+		}
+	}
+	return parsed, nil
 }
 
 func (s *Hysteria2) ExportToURL() string {
@@ -271,6 +329,21 @@ func (s *Hysteria2) ExportToURL() string {
 	if s.ObfsPassword != "" {
 		q.Set("obfs", "salamander")
 		q.Set("obfs-password", s.ObfsPassword)
+	}
+	if s.InitStreamReceiveWindow > 0 {
+		q.Set("init_stream_receive_window", strconv.FormatUint(s.InitStreamReceiveWindow, 10))
+	}
+	if s.MaxStreamReceiveWindow > 0 {
+		q.Set("max_stream_receive_window", strconv.FormatUint(s.MaxStreamReceiveWindow, 10))
+	}
+	if s.InitConnReceiveWindow > 0 {
+		q.Set("init_conn_receive_window", strconv.FormatUint(s.InitConnReceiveWindow, 10))
+	}
+	if s.MaxConnReceiveWindow > 0 {
+		q.Set("max_conn_receive_window", strconv.FormatUint(s.MaxConnReceiveWindow, 10))
+	}
+	if s.DisablePathMTUDiscovery {
+		q.Set("disable_mtu_discovery", "1")
 	}
 	t.RawQuery = q.Encode()
 	return t.String()

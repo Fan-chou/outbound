@@ -14,14 +14,19 @@ import (
 const (
 	// Initial windows start small so idle/low-traffic connections keep a low
 	// memory footprint; quic-go's BDP auto-tuning doubles them up to the Max
-	// values below when the measured RTTxbandwidth actually needs it. This
-	// keeps the steady-state memory floor small without capping peak speed.
-	defaultStreamReceiveWindow    = 8 * 1024 * 1024  // 8MB initial (upstream default)
-	defaultConnReceiveWindow      = 20 * 1024 * 1024 // 20MB initial (stream x2.5)
-	defaultMaxStreamReceiveWindow = 32 * 1024 * 1024 // 32MB ceiling - netem sweep peak (1Gbps x 200ms BDP)
-	defaultMaxConnReceiveWindow   = 64 * 1024 * 1024 // 64MB ceiling - stream x2, measured peak combo
-	defaultMaxIdleTimeout         = 60 * time.Second // 30→60: tolerate loss bursts of up to 12 keepalives (at 5s interval) instead of 3 (at 10s)
-	defaultKeepAlivePeriod        = 5 * time.Second  // 10→5: more frequent keepalives to maintain NAT binding on lossy links
+	// values below when the measured RTTxbandwidth actually needs it. Keeping
+	// the connection receive window at least 8x the per-stream window ensures
+	// 1-2 stalled streams cannot exhaust the shared connection flow-control
+	// budget and starve concurrent active streams (dae#1166).
+	defaultStreamReceiveWindow    = 4 * 1024 * 1024   // 4MB initial
+	defaultMaxStreamReceiveWindow = 16 * 1024 * 1024  // 16MB ceiling
+	defaultConnReceiveWindow      = 32 * 1024 * 1024  // 32MB initial (stream x8)
+	defaultMaxConnReceiveWindow   = 128 * 1024 * 1024 // 128MB ceiling (stream x8)
+	minConnToStreamWindowRatio    = 8
+	maxAutoConnReceiveWindow      = 512 * 1024 * 1024 // cap auto-scaled conn window well below 1 GiB
+	defaultObfsInitialPacketSize  = 1200              // fit 8B Salamander overhead inside 1280 WireGuard MTU
+	defaultMaxIdleTimeout         = 60 * time.Second  // 30→60: tolerate loss bursts of up to 12 keepalives (at 5s interval) instead of 3 (at 10s)
+	defaultKeepAlivePeriod        = 5 * time.Second   // 10→5: more frequent keepalives to maintain NAT binding on lossy links
 )
 
 type Config struct {
@@ -50,25 +55,53 @@ func (c *Config) verifyAndFill() error {
 	if c.ServerAddr == nil {
 		return errors.ConfigError{Field: "ServerAddr", Reason: "must be set"}
 	}
+	if c.QUICConfig.InitialStreamReceiveWindow != 0 && c.QUICConfig.InitialStreamReceiveWindow < 16384 {
+		return errors.ConfigError{Field: "QUICConfig.InitialStreamReceiveWindow", Reason: "must be at least 16384"}
+	}
+	if c.QUICConfig.MaxStreamReceiveWindow != 0 && c.QUICConfig.MaxStreamReceiveWindow < 16384 {
+		return errors.ConfigError{Field: "QUICConfig.MaxStreamReceiveWindow", Reason: "must be at least 16384"}
+	}
+	if c.QUICConfig.InitialConnectionReceiveWindow != 0 && c.QUICConfig.InitialConnectionReceiveWindow < 16384 {
+		return errors.ConfigError{Field: "QUICConfig.InitialConnectionReceiveWindow", Reason: "must be at least 16384"}
+	}
+	if c.QUICConfig.MaxConnectionReceiveWindow != 0 && c.QUICConfig.MaxConnectionReceiveWindow < 16384 {
+		return errors.ConfigError{Field: "QUICConfig.MaxConnectionReceiveWindow", Reason: "must be at least 16384"}
+	}
+
+	// Fill stream windows first so un-overridden connection windows maintain at
+	// least the minimum connection-to-stream ratio.
 	if c.QUICConfig.InitialStreamReceiveWindow == 0 {
 		c.QUICConfig.InitialStreamReceiveWindow = defaultStreamReceiveWindow
-	} else if c.QUICConfig.InitialStreamReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.InitialStreamReceiveWindow", Reason: "must be at least 16384"}
+		if c.QUICConfig.MaxStreamReceiveWindow != 0 && c.QUICConfig.InitialStreamReceiveWindow > c.QUICConfig.MaxStreamReceiveWindow {
+			c.QUICConfig.InitialStreamReceiveWindow = c.QUICConfig.MaxStreamReceiveWindow
+		}
 	}
 	if c.QUICConfig.MaxStreamReceiveWindow == 0 {
 		c.QUICConfig.MaxStreamReceiveWindow = defaultMaxStreamReceiveWindow
-	} else if c.QUICConfig.MaxStreamReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.MaxStreamReceiveWindow", Reason: "must be at least 16384"}
+		if c.QUICConfig.MaxStreamReceiveWindow < c.QUICConfig.InitialStreamReceiveWindow {
+			c.QUICConfig.MaxStreamReceiveWindow = c.QUICConfig.InitialStreamReceiveWindow
+		}
+	} else if c.QUICConfig.InitialStreamReceiveWindow > c.QUICConfig.MaxStreamReceiveWindow {
+		return errors.ConfigError{Field: "QUICConfig.MaxStreamReceiveWindow", Reason: "must be at least InitialStreamReceiveWindow"}
 	}
+
 	if c.QUICConfig.InitialConnectionReceiveWindow == 0 {
-		c.QUICConfig.InitialConnectionReceiveWindow = defaultConnReceiveWindow
-	} else if c.QUICConfig.InitialConnectionReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.InitialConnectionReceiveWindow", Reason: "must be at least 16384"}
+		c.QUICConfig.InitialConnectionReceiveWindow = autoConnReceiveWindow(defaultConnReceiveWindow, c.QUICConfig.InitialStreamReceiveWindow)
+		if c.QUICConfig.MaxConnectionReceiveWindow != 0 && c.QUICConfig.InitialConnectionReceiveWindow > c.QUICConfig.MaxConnectionReceiveWindow {
+			c.QUICConfig.InitialConnectionReceiveWindow = c.QUICConfig.MaxConnectionReceiveWindow
+		}
 	}
 	if c.QUICConfig.MaxConnectionReceiveWindow == 0 {
-		c.QUICConfig.MaxConnectionReceiveWindow = defaultMaxConnReceiveWindow
-	} else if c.QUICConfig.MaxConnectionReceiveWindow < 16384 {
-		return errors.ConfigError{Field: "QUICConfig.MaxConnectionReceiveWindow", Reason: "must be at least 16384"}
+		maxConn := autoConnReceiveWindow(defaultMaxConnReceiveWindow, c.QUICConfig.MaxStreamReceiveWindow)
+		if maxConn < c.QUICConfig.InitialConnectionReceiveWindow {
+			maxConn = c.QUICConfig.InitialConnectionReceiveWindow
+		}
+		c.QUICConfig.MaxConnectionReceiveWindow = maxConn
+	} else if c.QUICConfig.InitialConnectionReceiveWindow > c.QUICConfig.MaxConnectionReceiveWindow {
+		return errors.ConfigError{Field: "QUICConfig.MaxConnectionReceiveWindow", Reason: "must be at least InitialConnectionReceiveWindow"}
+	}
+	if c.QUICConfig.InitialPacketSize == 0 && c.ObfsPassword != "" {
+		c.QUICConfig.InitialPacketSize = defaultObfsInitialPacketSize
 	}
 	if c.QUICConfig.MaxIdleTimeout == 0 {
 		c.QUICConfig.MaxIdleTimeout = defaultMaxIdleTimeout
@@ -84,6 +117,17 @@ func (c *Config) verifyAndFill() error {
 
 	c.filled = true
 	return nil
+}
+
+func autoConnReceiveWindow(baseDefault, streamWindow uint64) uint64 {
+	if streamWindow > maxAutoConnReceiveWindow/minConnToStreamWindowRatio {
+		return max(baseDefault, maxAutoConnReceiveWindow)
+	}
+	scaled := streamWindow * minConnToStreamWindowRatio
+	if scaled > maxAutoConnReceiveWindow {
+		scaled = maxAutoConnReceiveWindow
+	}
+	return max(baseDefault, scaled)
 }
 
 type ConnFactory interface {
@@ -125,6 +169,7 @@ type QUICConfig struct {
 	MaxConnectionReceiveWindow     uint64
 	MaxIdleTimeout                 time.Duration
 	KeepAlivePeriod                time.Duration
+	InitialPacketSize              uint16
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
 }
 

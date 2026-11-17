@@ -1161,3 +1161,165 @@ func TestE2EHysteria2ObfsSalamander(t *testing.T) {
 		}
 	}
 }
+
+// startTCPBlastTarget starts a TCP target that immediately streams totalBytes
+// of deterministic patterned data to each accepted connection and reports total
+// bytes written into accepted connections via an atomic counter.
+func startTCPBlastTarget(t *testing.T, totalBytes int64) (net.Addr, *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("blast listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	var written atomic.Int64
+	chunk := make([]byte, 64<<10)
+	for i := range chunk {
+		chunk[i] = byte((i*7 + 13) & 0xff)
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetWriteDeadline(time.Now().Add(60 * time.Second))
+				var sent int64
+				for sent < totalBytes {
+					n := int64(len(chunk))
+					if rem := totalBytes - sent; rem < n {
+						n = rem
+					}
+					wn, err := c.Write(chunk[:n])
+					if wn > 0 {
+						written.Add(int64(wn))
+						sent += int64(wn)
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+	return ln.Addr(), &written
+}
+
+// TestE2EHysteria2PausedStreamsDoNotStallActivePeers verifies dae#1166: pausing
+// client reads on 2 streams on a shared Hysteria2 connection must not exhaust
+// the connection receive window or stall 2 active streams downloading > 64 MiB.
+func TestE2EHysteria2PausedStreamsDoNotStallActivePeers(t *testing.T) {
+	runScenario := func(t *testing.T, extraQuery string, pausedMinBuffered int64, activePerStreamBytes int64) {
+		t.Helper()
+		const pausedCount = 2
+		const activeCount = 2
+		const pausedTargetSend = 20 << 20 // exceeds 16 MiB max stream window so paused streams fill completely
+
+		pausedTargetAddr, pausedWritten := startTCPBlastTarget(t, pausedTargetSend)
+		activeTargetAddr, _ := startTCPBlastTarget(t, activePerStreamBytes)
+		proxyAddr := startHysteria2Server(t, "user:pass")
+		d := newHysteria2ClientDialerFromLink(t, proxyAddr, "user", "pass", extraQuery)
+
+		ctx := deadlineCtx(t)
+
+		// Open 2 streams and consume only the first byte so the server TCP
+		// relay starts pumping, then pause reading indefinitely to build up
+		// unread receive-window backpressure inside quic-go.
+		pausedConns := make([]netproxy.Conn, pausedCount)
+		for i := 0; i < pausedCount; i++ {
+			c, err := d.DialContext(ctx, "tcp", pausedTargetAddr.String())
+			if err != nil {
+				t.Fatalf("dial paused stream %d: %v", i, err)
+			}
+			pausedConns[i] = c
+			defer c.Close()
+
+			if err := c.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+				t.Fatalf("paused stream %d SetReadDeadline: %v", i, err)
+			}
+			var one [1]byte
+			if _, err := io.ReadFull(c, one[:]); err != nil {
+				t.Fatalf("paused stream %d initial ReadFull: %v", i, err)
+			}
+		}
+
+		// Wait until both paused streams have pushed substantial unread data
+		// into the client's QUIC receive buffers before starting active streams.
+		wantTotalPaused := int64(pausedCount) * pausedMinBuffered
+		deadline := time.Now().Add(10 * time.Second)
+		for pausedWritten.Load() < wantTotalPaused && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := pausedWritten.Load(); got < wantTotalPaused {
+			t.Fatalf("paused streams only wrote %d bytes before active phase, want >= %d", got, wantTotalPaused)
+		}
+
+		// Transfer > 64 MiB total across the 2 active streams while the 2 paused
+		// streams remain open and unread.
+		var wg sync.WaitGroup
+		errCh := make(chan error, activeCount)
+		for i := 0; i < activeCount; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				c, err := d.DialContext(ctx, "tcp", activeTargetAddr.String())
+				if err != nil {
+					errCh <- fmt.Errorf("active stream %d dial: %w", idx, err)
+					return
+				}
+				defer c.Close()
+				if err := c.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+					errCh <- fmt.Errorf("active stream %d SetReadDeadline: %v", idx, err)
+					return
+				}
+				buf := make([]byte, 64<<10)
+				var got int64
+				for got < activePerStreamBytes {
+					n, err := c.Read(buf)
+					if n > 0 {
+						for j := 0; j < n; j++ {
+							pos := (got + int64(j)) % (64 << 10)
+							want := byte((pos*7 + 13) & 0xff)
+							if buf[j] != want {
+								errCh <- fmt.Errorf("active stream %d payload mismatch at %d: got %#x want %#x", idx, got+int64(j), buf[j], want)
+								return
+							}
+						}
+						got += int64(n)
+					}
+					if got >= activePerStreamBytes {
+						break
+					}
+					if err != nil {
+						errCh <- fmt.Errorf("active stream %d read at %d/%d: %w", idx, got, activePerStreamBytes, err)
+						return
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Fatal(err)
+		}
+
+		// Explicitly close paused streams before server cleanup so serveTCPRequest exits promptly.
+		for _, c := range pausedConns {
+			_ = c.Close()
+		}
+	}
+
+	t.Run("default_windows", func(t *testing.T) {
+		// 2 active streams x 65 MiB = 130 MiB (> 64 MiB and > 128 MiB) while 2 paused streams hold >= 4 MiB each.
+		runScenario(t, "", 4<<20, 65<<20)
+	})
+
+	t.Run("auto_scaled_conn_window_from_stream_query", func(t *testing.T) {
+		// Explicit 16 MiB initial+max stream window without conn window param must
+		// auto-scale conn window to >= 128 MiB (8x) so 2 fully-saturated 16 MiB
+		// paused streams (32 MiB total unread) still allow > 64 MiB per active peer.
+		runScenario(t, "&init_stream_receive_window=16777216&max_stream_receive_window=16777216", 16<<20, 65<<20)
+	})
+}

@@ -269,3 +269,35 @@ func (c *closeTrackingQuicConn) SendDatagramContext(ctx context.Context, p []byt
 	}
 	return c.SendDatagram(p)
 }
+
+func TestBuildQUICConfigSalamanderAndMTUFields(t *testing.T) {
+	obfsCfg := &Config{
+		ObfsPassword: "psk",
+		QUICConfig: QUICConfig{
+			InitialStreamReceiveWindow:     4 * 1024 * 1024,
+			MaxStreamReceiveWindow:         16 * 1024 * 1024,
+			InitialConnectionReceiveWindow: 32 * 1024 * 1024,
+			MaxConnectionReceiveWindow:     128 * 1024 * 1024,
+			DisablePathMTUDiscovery:        true,
+		},
+	}
+	qc := buildQUICConfig(obfsCfg)
+	if qc.InitialPacketSize != 1200 {
+		t.Fatalf("InitialPacketSize with obfs = %d, want 1200", qc.InitialPacketSize)
+	}
+	if !qc.DisablePathMTUDiscovery {
+		t.Fatal("DisablePathMTUDiscovery = false, want true")
+	}
+
+	plainCfg := &Config{
+		QUICConfig: QUICConfig{
+			InitialPacketSize: 1350,
+		},
+	}
+	if got := buildQUICConfig(plainCfg).InitialPacketSize; got != 1350 {
+		t.Fatalf("explicit InitialPacketSize = %d, want 1350", got)
+	}
+	if got := buildQUICConfig(&Config{}).InitialPacketSize; got != 0 {
+		t.Fatalf("default InitialPacketSize without obfs = %d, want 0", got)
+	}
+}

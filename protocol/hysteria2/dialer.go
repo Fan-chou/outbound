@@ -26,9 +26,14 @@ type Dialer struct {
 }
 
 type Feature1 struct {
-	BandwidthConfig client.BandwidthConfig
-	UDPHopInterval  time.Duration
-	ObfsPassword    string
+	BandwidthConfig         client.BandwidthConfig
+	UDPHopInterval          time.Duration
+	ObfsPassword            string
+	InitStreamReceiveWindow uint64
+	MaxStreamReceiveWindow  uint64
+	InitConnReceiveWindow   uint64
+	MaxConnReceiveWindow    uint64
+	DisablePathMTUDiscovery bool
 }
 
 func toClientTLSConfig(config *tls.Config) client.TLSConfig {
@@ -42,6 +47,23 @@ func toClientTLSConfig(config *tls.Config) client.TLSConfig {
 }
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+	config, metadata, err := buildClientConfig(nextDialer, header)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := client.NewClient(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Dialer{
+		client:   client,
+		metadata: metadata,
+	}, nil
+}
+
+func buildClientConfig(nextDialer netproxy.Dialer, header protocol.Header) (*client.Config, protocol.Metadata, error) {
 	host, port, hostPort := parseServerAddrString(header.ProxyAddress)
 
 	metadata := protocol.Metadata{
@@ -65,11 +87,16 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		// NewDialer; a configuration error must come back as an error.
 		typed, ok := feature.(*Feature1)
 		if !ok {
-			return nil, fmt.Errorf("hysteria2: unexpected Feature1 type %T, want *Feature1", feature)
+			return nil, protocol.Metadata{}, fmt.Errorf("hysteria2: unexpected Feature1 type %T, want *Feature1", feature)
 		}
 		config.BandwidthConfig = typed.BandwidthConfig
 		config.UDPHopInterval = typed.UDPHopInterval
 		config.ObfsPassword = typed.ObfsPassword
+		config.QUICConfig.InitialStreamReceiveWindow = typed.InitStreamReceiveWindow
+		config.QUICConfig.MaxStreamReceiveWindow = typed.MaxStreamReceiveWindow
+		config.QUICConfig.InitialConnectionReceiveWindow = typed.InitConnReceiveWindow
+		config.QUICConfig.MaxConnectionReceiveWindow = typed.MaxConnReceiveWindow
+		config.QUICConfig.DisablePathMTUDiscovery = typed.DisablePathMTUDiscovery
 	}
 
 	var err error
@@ -83,7 +110,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		config.ServerAddr, err = udphop.ParseUDPHopAddr(hostPort)
 	}
 	if err != nil {
-		return nil, err
+		return nil, protocol.Metadata{}, err
 	}
 
 	if config.ServerAddr.Network() == "udphop" {
@@ -126,16 +153,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 			},
 		}
 	}
-
-	client, err := client.NewClient(config)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Dialer{
-		client:   client,
-		metadata: metadata,
-	}, nil
+	return config, metadata, nil
 }
 
 // parseServerAddrString parses server address string.

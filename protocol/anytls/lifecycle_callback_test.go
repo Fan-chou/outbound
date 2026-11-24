@@ -29,7 +29,7 @@ func TestSessionCallbackCloseReuseRace(t *testing.T) {
 func TestSessionCallbackIdleOverflow(t *testing.T) {
 	d := &Dialer{sessions: make(map[uint64]*session), idleSessions: make(map[uint64]*session)}
 	defer d.Close()
-	for i := uint64(1); i <= 2; i++ {
+	for i := uint64(1); i <= maxIdleSessions+1; i++ {
 		s := newSession(&recordingConn{}, i)
 		s.owner = d
 		d.sessions[i] = s
@@ -40,7 +40,7 @@ func TestSessionCallbackIdleOverflow(t *testing.T) {
 		}
 		_ = st.Close()
 	}
-	if len(d.idleSessions) != 1 || len(d.sessions) != 1 {
-		t.Fatal("overflow session not retired")
+	if len(d.idleSessions) != maxIdleSessions || len(d.sessions) != maxIdleSessions {
+		t.Fatalf("overflow session not retired: idle=%d total=%d want=%d", len(d.idleSessions), len(d.sessions), maxIdleSessions)
 	}
 }

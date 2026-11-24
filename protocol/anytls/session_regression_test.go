@@ -252,14 +252,13 @@ func TestNewStreamBatchesInitialSessionFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newStream(second) error = %v", err)
 	}
-	if len(conn.writes) != 3 {
-		t.Fatalf("writes after reuse = %d, want initial batch plus SYN and PSH", len(conn.writes))
+	if len(conn.writes) != 2 {
+		t.Fatalf("writes after reuse = %d, want 2 (initial batch plus coalesced SYN+PSH)", len(conn.writes))
 	}
-	for i, want := range []byte{cmdSYN, cmdPSH} {
-		reusedFrames := decodeTestFrames(t, conn.writes[i+1])
-		if len(reusedFrames) != 1 || reusedFrames[0].cmd != want || reusedFrames[0].sid != second.id {
-			t.Fatalf("reuse write %d = %+v, want cmd %d sid %d", i, reusedFrames, want, second.id)
-		}
+	reusedFrames := decodeTestFrames(t, conn.writes[1])
+	if len(reusedFrames) != 2 || reusedFrames[0].cmd != cmdSYN || reusedFrames[0].sid != second.id ||
+		reusedFrames[1].cmd != cmdPSH || reusedFrames[1].sid != second.id {
+		t.Fatalf("reuse write = %+v, want coalesced [SYN/%d, PSH/%d]", reusedFrames, second.id, second.id)
 	}
 	_ = s.Close()
 }

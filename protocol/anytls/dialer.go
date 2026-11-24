@@ -20,7 +20,7 @@ import (
 
 const (
 	sessionReadBufferSize     = 4 << 10
-	maxIdleSessions           = 1
+	maxIdleSessions           = 6
 	idleSessionTimeout        = 30 * time.Second
 	idleSessionCheckInterval  = 1 * time.Second
 	idleSessionProbeThreshold = 3 * time.Second
@@ -59,12 +59,18 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		IsClient: header.IsClient,
 	}
 	sum := sha256.Sum256([]byte(header.Password))
+	tlsCfg := header.TlsConfig
+	if tlsCfg != nil && tlsCfg.ClientSessionCache == nil {
+		cloned := tlsCfg.Clone()
+		cloned.ClientSessionCache = tls.NewLRUClientSessionCache(16)
+		tlsCfg = cloned
+	}
 	d := &Dialer{
 		proxyAddress: header.ProxyAddress,
 		nextDialer:   nextDialer,
 		metadata:     metadata,
 		key:          sum[:],
-		tlsConfig:    header.TlsConfig,
+		tlsConfig:    tlsCfg,
 		idleSessions: make(map[uint64]*session),
 		sessions:     make(map[uint64]*session),
 		janitorDone:  make(chan struct{}),
@@ -256,12 +262,26 @@ func (d *Dialer) popIdleSessionForReuse() (*session, error) {
 	if d.closed {
 		return nil, net.ErrClosed
 	}
-	for seq, s := range d.idleSessions {
-		delete(d.idleSessions, seq)
-		if s.closed.Load() || s.activeStreams.Load() != 0 || !s.state.CompareAndSwap(sessionStateIdle, sessionStateActive) {
+	// Prefer the most recently active (LIFO) idle session so reused streams
+	// ride the warmest TCP cwnd and freshest middlebox NAT mapping while
+	// colder sessions naturally age out via idleSessionTimeout.
+	for len(d.idleSessions) > 0 {
+		var bestSeq uint64
+		var best *session
+		var bestIdleAt int64 = -1
+		for seq, s := range d.idleSessions {
+			idleAt := s.idleAt.Load()
+			if best == nil || idleAt > bestIdleAt || (idleAt == bestIdleAt && seq > bestSeq) {
+				best = s
+				bestSeq = seq
+				bestIdleAt = idleAt
+			}
+		}
+		delete(d.idleSessions, bestSeq)
+		if best.closed.Load() || best.activeStreams.Load() != 0 || !best.state.CompareAndSwap(sessionStateIdle, sessionStateActive) {
 			continue
 		}
-		return s, nil
+		return best, nil
 	}
 	return nil, nil
 }
@@ -355,6 +375,27 @@ func (d *Dialer) maintainIdleSessions(now time.Time) {
 		if reclose {
 			_ = s.Close()
 		}
+	}
+}
+
+// ResetTransport immediately evicts and closes all pooled idle carrier sessions
+// without closing the dialer, so subsequent dials after a WAN IP change open
+// fresh TCP+TLS carriers instead of hitting dead NAT/routing state.
+func (d *Dialer) ResetTransport() {
+	d.idleSessionLock.Lock()
+	if d.closed || len(d.idleSessions) == 0 {
+		d.idleSessionLock.Unlock()
+		return
+	}
+	stale := make([]*session, 0, len(d.idleSessions))
+	for seq, s := range d.idleSessions {
+		delete(d.idleSessions, seq)
+		stale = append(stale, s)
+	}
+	d.idleSessionLock.Unlock()
+
+	for _, s := range stale {
+		_ = s.Close()
 	}
 }
 

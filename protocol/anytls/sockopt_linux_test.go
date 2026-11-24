@@ -51,6 +51,15 @@ func TestTuneTCPCarrierConnSetsNotSentLowatOnLinux(t *testing.T) {
 	if got != defaultTCPNotSentLowat {
 		t.Fatalf("TCP_NOTSENT_LOWAT = %d, want %d", got, defaultTCPNotSentLowat)
 	}
+	var gotUT int
+	if err := raw.Control(func(fd uintptr) {
+		gotUT, getErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT)
+	}); err != nil {
+		t.Fatalf("Control(TCP_USER_TIMEOUT): %v", err)
+	}
+	if getErr == nil && gotUT != defaultTCPUserTimeoutMs {
+		t.Fatalf("TCP_USER_TIMEOUT = %d, want %d", gotUT, defaultTCPUserTimeoutMs)
+	}
 }
 
 func TestSetTCPNotSentLowatIgnoresUnsupportedSocketError(t *testing.T) {

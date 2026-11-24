@@ -21,8 +21,9 @@ func init() {
 }
 
 type Dialer struct {
-	client   client.Client
-	metadata protocol.Metadata
+	client     client.Client
+	nextDialer netproxy.Dialer
+	metadata   protocol.Metadata
 }
 
 type Feature1 struct {
@@ -58,8 +59,9 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 
 	return &Dialer{
-		client:   client,
-		metadata: metadata,
+		client:     client,
+		nextDialer: nextDialer,
+		metadata:   metadata,
 	}, nil
 }
 
@@ -205,6 +207,22 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 		return d.client.UDP(address, ctx)
 	default:
 		return nil, fmt.Errorf("unsupported network: %s", network)
+	}
+}
+
+func (d *Dialer) UnwrapDialer() netproxy.Dialer {
+	if d == nil {
+		return nil
+	}
+	return d.nextDialer
+}
+
+func (d *Dialer) ResetTransport() {
+	if d == nil || d.client == nil {
+		return
+	}
+	if r, ok := d.client.(netproxy.TransportResetter); ok {
+		r.ResetTransport()
 	}
 }
 

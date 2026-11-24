@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	outbounderrors "github.com/daeuniverse/outbound/common/errors"
@@ -26,7 +27,29 @@ import (
 const (
 	closeErrCodeOK            = 0x100 // HTTP3 ErrCodeNoError
 	closeErrCodeProtocolError = 0x101 // HTTP3 ErrCodeGeneralProtocolError
+
+	defaultConnectTimeout        = 10 * time.Second
+	blackholeMinConsecutive      = 2
+	blackholeMinElapsed          = 2 * time.Second
+	blackholeHardConsecutive     = 3
+	defaultClientSessionCacheCap = 8
 )
+
+var errConnectReset = errors.New("hysteria2: connect superseded by transport reset")
+
+type connectAttempt struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+	once   sync.Once
+	err    error
+}
+
+func (a *connectAttempt) finish(err error) {
+	a.once.Do(func() {
+		a.err = err
+		close(a.done)
+	})
+}
 
 type Client interface {
 	TCP(addr string, ctx context.Context) (netproxy.Conn, error)
@@ -44,7 +67,8 @@ func NewClient(config *Config) (Client, error) {
 		return nil, err
 	}
 	c := &clientImpl{
-		config: config,
+		config:       config,
+		sessionCache: tls.NewLRUClientSessionCache(defaultClientSessionCacheCap),
 	}
 	return c, nil
 }
@@ -52,15 +76,23 @@ func NewClient(config *Config) (Client, error) {
 // TODO: How to handle quic conn for the same dialer with different marks?
 
 type clientImpl struct {
-	config *Config
+	config       *Config
+	sessionCache tls.ClientSessionCache
 
 	pktConn net.PacketConn
 	conn    quic.Connection
 
 	udpSM *udpSessionManager
 
-	m      sync.Mutex
-	closed bool
+	m          sync.Mutex
+	closed     bool
+	connecting *connectAttempt
+
+	// Silent blackhole rapid circuit-breaker state (guarded by m; fast-path
+	// reads hasStreamTimeouts atomically to avoid lock contention when healthy).
+	hasStreamTimeouts         atomic.Bool
+	consecutiveStreamTimeouts int
+	firstStreamTimeoutAt      time.Time
 }
 
 // closeExistingLocked closes the old QUIC connection, packet conn, and UDP
@@ -82,21 +114,15 @@ func (c *clientImpl) closeExistingLocked() {
 	}
 	c.conn = nil
 	c.pktConn = nil
+	c.consecutiveStreamTimeouts = 0
+	c.firstStreamTimeoutAt = time.Time{}
+	c.hasStreamTimeouts.Store(false)
 }
 
-func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
-	if c.closed {
-		return nil, coreErrs.ClosedError{}
-	}
-
-	// Close old resources before creating new ones to prevent goroutine and
-	// socket leaks (especially important for UDPHopPacketConn which spawns
-	// recvLoop + hopLoop goroutines).
-	c.closeExistingLocked()
-
+func (c *clientImpl) dialTransport(ctx context.Context) (net.PacketConn, quic.Connection, *udpSessionManager, *HandshakeInfo, error) {
 	pktConn, err := c.config.ConnFactory.New(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, nil, err
 	}
 	if c.config.ObfsPassword != "" {
 		// Salamander obfuscation: wrap the packet conn so every QUIC packet
@@ -104,12 +130,15 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 		pktConn, err = obfs.WrapPacketConnSalamander(pktConn, []byte(c.config.ObfsPassword))
 		if err != nil {
 			_ = pktConn.Close()
-			return nil, err
+			return nil, nil, nil, nil, err
 		}
 	}
 	serverAddr := quicRemoteAddr(pktConn, c.config.ServerAddr)
 	// Convert config to TLS config & QUIC config
 	tlsConfig := c.config.TLSConfig.toTLSConfig()
+	if tlsConfig.ClientSessionCache == nil && c.sessionCache != nil {
+		tlsConfig.ClientSessionCache = c.sessionCache
+	}
 	quicConfig := buildQUICConfig(c.config)
 	// Prepare Transport
 	var conn quic.EarlyConnection
@@ -133,7 +162,8 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
 	if err != nil {
-		return nil, err
+		_ = pktConn.Close()
+		return nil, nil, nil, nil, err
 	}
 	req.Header = make(http.Header)
 	protocol.AuthRequestToHeader(req.Header, protocol.AuthRequest{
@@ -146,7 +176,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
 		_ = pktConn.Close()
-		return nil, coreErrs.ConnectError{Err: err}
+		return nil, nil, nil, nil, coreErrs.ConnectError{Err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != protocol.StatusAuthOK {
@@ -154,7 +184,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
 		_ = pktConn.Close()
-		return nil, coreErrs.AuthError{StatusCode: resp.StatusCode}
+		return nil, nil, nil, nil, coreErrs.AuthError{StatusCode: resp.StatusCode}
 	}
 	// Auth OK
 	authResp := protocol.AuthResponseFromHeader(resp.Header)
@@ -177,15 +207,101 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 			congestion.UseBBR(conn)
 		}
 	}
-	c.pktConn = pktConn
-	c.conn = conn
+	var udpSM *udpSessionManager
 	if authResp.UDPEnabled {
-		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
+		udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
 	}
-	return &HandshakeInfo{
+	return pktConn, conn, udpSM, &HandshakeInfo{
 		UDPEnabled: authResp.UDPEnabled,
 		Tx:         actualTx,
 	}, nil
+}
+
+func (c *clientImpl) runConnectAttempt(connectCtx context.Context, attempt *connectAttempt) {
+	defer attempt.cancel()
+	pktConn, conn, udpSM, _, err := c.dialTransport(connectCtx)
+
+	c.m.Lock()
+	if c.closed || c.connecting != attempt {
+		c.m.Unlock()
+		if udpSM != nil {
+			udpSM.Close()
+		}
+		if conn != nil {
+			_ = conn.CloseWithError(closeErrCodeOK, "superseded")
+		}
+		if pktConn != nil {
+			_ = pktConn.Close()
+		}
+		attempt.finish(coreErrs.ClosedError{})
+		return
+	}
+	if err != nil {
+		c.connecting = nil
+		c.m.Unlock()
+		attempt.finish(err)
+		return
+	}
+	c.closeExistingLocked()
+	c.pktConn = pktConn
+	c.conn = conn
+	c.udpSM = udpSM
+	c.connecting = nil
+	c.m.Unlock()
+	attempt.finish(nil)
+}
+
+// ensureConnected returns an active QUIC connection snapshot without holding
+// c.m during the QUIC/H3 handshake. Concurrent callers coalesce onto a single
+// in-flight handshake and honor their own ctx.Done() promptly without aborting
+// the shared handshake for other callers.
+func (c *clientImpl) ensureConnected(ctx context.Context) (quic.Connection, *udpSessionManager, error) {
+	for {
+		c.m.Lock()
+		if err := ctx.Err(); err != nil {
+			c.m.Unlock()
+			return nil, nil, err
+		}
+		if c.closed {
+			c.m.Unlock()
+			return nil, nil, coreErrs.ClosedError{}
+		}
+		if c.active() {
+			conn, udpSM := c.conn, c.udpSM
+			c.m.Unlock()
+			return conn, udpSM, nil
+		}
+		attempt := c.connecting
+		if attempt == nil {
+			c.closeExistingLocked()
+			timeout := defaultConnectTimeout
+			if dl, ok := ctx.Deadline(); ok {
+				if rem := time.Until(dl); rem > timeout {
+					timeout = rem
+				}
+			}
+			connectCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			attempt = &connectAttempt{
+				done:   make(chan struct{}),
+				cancel: cancel,
+			}
+			c.connecting = attempt
+			go c.runConnectAttempt(connectCtx, attempt)
+		}
+		c.m.Unlock()
+
+		select {
+		case <-attempt.done:
+			if attempt.err != nil {
+				if errors.Is(attempt.err, errConnectReset) {
+					continue
+				}
+				return nil, nil, attempt.err
+			}
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
 }
 
 func buildQUICConfig(cfg *Config) *quic.Config {
@@ -240,14 +356,44 @@ func (c *clientImpl) Close() error {
 		return nil
 	}
 	c.closed = true
+	att := c.connecting
+	c.connecting = nil
 	udpSM := c.udpSM
 	if udpSM != nil && !udpSM.closeWhenIdle(c.closeExistingWhenDrained) {
 		c.m.Unlock()
+		if att != nil {
+			att.cancel()
+			att.finish(coreErrs.ClosedError{})
+		}
 		return nil
 	}
 	c.closeExistingLocked()
 	c.m.Unlock()
+	if att != nil {
+		att.cancel()
+		att.finish(coreErrs.ClosedError{})
+	}
 	return nil
+}
+
+// ResetTransport tears down the active QUIC connection and UDP socket (and
+// cancels any in-flight handshake) without permanently closing the client.
+// The next TCP/UDP dial will immediately establish a fresh tunnel over a new
+// underlay socket.
+func (c *clientImpl) ResetTransport() {
+	c.m.Lock()
+	if c.closed {
+		c.m.Unlock()
+		return
+	}
+	att := c.connecting
+	c.connecting = nil
+	c.closeExistingLocked()
+	c.m.Unlock()
+	if att != nil {
+		att.cancel()
+		att.finish(errConnectReset)
+	}
 }
 
 // closeExistingWhenDrained is the udpSessionManager drain callback. It can
@@ -275,33 +421,14 @@ func (c *clientImpl) openStream(conn quic.Connection) (*utils.QStream, error) {
 }
 
 func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error) {
-	c.m.Lock()
-	select {
-	case <-ctx.Done():
-		c.m.Unlock()
-		return nil, errors.New("context deadline exceeded")
-	default:
+	connSnapshot, _, err := c.ensureConnected(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if c.closed {
-		c.m.Unlock()
-		return nil, coreErrs.ClosedError{}
-	}
-	if !c.active() {
-		_, err := c.connect(ctx)
-		if err != nil {
-			c.m.Unlock()
-			return nil, err
-		}
-	}
-	// Snapshot the connection BEFORE releasing the lock so that
-	// handleIfConnectionClosed can compare against the exact instance
-	// that was active when this call started.
-	connSnapshot := c.conn
-	c.m.Unlock()
 
 	stream, err := c.openStream(connSnapshot)
 	if err != nil {
-		c.handleIfConnectionClosed(err, connSnapshot)
+		c.recordStreamError(err, connSnapshot)
 		return nil, err
 	}
 	var dialDeadline time.Time
@@ -316,7 +443,7 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 	err = protocol.WriteTCPRequest(stream, addr)
 	if err != nil {
 		_ = stream.Close()
-		c.handleIfConnectionClosed(err, connSnapshot)
+		c.recordStreamError(err, connSnapshot)
 		return nil, err
 	}
 	if c.config.FastOpen {
@@ -330,15 +457,23 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 			PseudoRemoteAddr: connSnapshot.RemoteAddr(),
 			Established:      false,
 			dialDeadline:     dialDeadline,
+			onResponse: func(respErr error) {
+				if respErr == nil {
+					c.recordStreamSuccess(connSnapshot)
+				} else {
+					c.recordStreamError(respErr, connSnapshot)
+				}
+			},
 		}, nil
 	}
 	// Read response
 	ok, msg, err := protocol.ReadTCPResponse(stream)
 	if err != nil {
 		_ = stream.Close()
-		c.handleIfConnectionClosed(err, connSnapshot)
+		c.recordStreamError(err, connSnapshot)
 		return nil, err
 	}
+	c.recordStreamSuccess(connSnapshot)
 	if !ok {
 		_ = stream.Close()
 		return nil, coreErrs.DialError{Message: "from remote: " + msg}
@@ -352,30 +487,10 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 }
 
 func (c *clientImpl) UDP(addr string, ctx context.Context) (netproxy.Conn, error) {
-	c.m.Lock()
-	select {
-	case <-ctx.Done():
-		c.m.Unlock()
-		return nil, errors.New("context deadline exceeded")
-	default:
+	connSnapshot, udpSMSnapshot, err := c.ensureConnected(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if c.closed {
-		c.m.Unlock()
-		return nil, coreErrs.ClosedError{}
-	}
-	if !c.active() {
-		_, err := c.connect(ctx)
-		if err != nil {
-			c.m.Unlock()
-			return nil, err
-		}
-	}
-	// Snapshot the connection BEFORE releasing the lock so that
-	// handleIfConnectionClosed can compare against the exact instance
-	// that was active when this call started.
-	connSnapshot := c.conn
-	udpSMSnapshot := c.udpSM
-	c.m.Unlock()
 
 	// Local input validation: a malformed target address must surface as a
 	// dial error without ever reaching the tunnel-fatal classification (and
@@ -390,6 +505,57 @@ func (c *clientImpl) UDP(addr string, ctx context.Context) (netproxy.Conn, error
 	conn, err := udpSMSnapshot.openUDP(addr, replyAddr)
 	c.handleIfConnectionClosed(err, connSnapshot)
 	return conn, err
+}
+
+func isStreamTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func (c *clientImpl) recordStreamSuccess(originConn quic.Connection) {
+	if !c.hasStreamTimeouts.Load() {
+		return
+	}
+	c.m.Lock()
+	if c.conn == originConn {
+		c.consecutiveStreamTimeouts = 0
+		c.firstStreamTimeoutAt = time.Time{}
+		c.hasStreamTimeouts.Store(false)
+	}
+	c.m.Unlock()
+}
+
+func (c *clientImpl) recordStreamError(err error, originConn quic.Connection) {
+	c.handleIfConnectionClosed(err, originConn)
+	if !isStreamTimeoutError(err) {
+		return
+	}
+	now := time.Now()
+	c.m.Lock()
+	defer c.m.Unlock()
+	if c.conn != originConn || c.conn == nil {
+		return
+	}
+	if c.consecutiveStreamTimeouts == 0 {
+		c.firstStreamTimeoutAt = now
+		c.hasStreamTimeouts.Store(true)
+	}
+	c.consecutiveStreamTimeouts++
+	if (c.consecutiveStreamTimeouts >= blackholeMinConsecutive && now.Sub(c.firstStreamTimeoutAt) >= blackholeMinElapsed) ||
+		c.consecutiveStreamTimeouts >= blackholeHardConsecutive {
+		// Multiple consecutive streams received no server response header on
+		// this QUIC connection while zero streams succeeded in between: the
+		// UDP 4-tuple is almost certainly silently blackholed (e.g. WAN IP or
+		// NAT mapping change). Tear it down now rather than waiting up to 60s
+		// for QUIC MaxIdleTimeout.
+		c.closeExistingLocked()
+	}
 }
 
 // wrapIfConnectionClosed checks if the error returned by quic-go
@@ -478,6 +644,7 @@ type tcpConn struct {
 	// reads, so every reader observes the same handshake outcome.
 	establishOnce sync.Once
 	respErr       error
+	onResponse    func(error)
 }
 
 func (c *tcpConn) readFastOpenResponse() error {
@@ -494,7 +661,13 @@ func (c *tcpConn) readFastOpenResponse() error {
 		ok, msg, err := protocol.ReadTCPResponse(c.Orig)
 		if err != nil {
 			c.respErr = err
+			if c.onResponse != nil {
+				c.onResponse(err)
+			}
 			return
+		}
+		if c.onResponse != nil {
+			c.onResponse(nil)
 		}
 		if !ok {
 			c.respErr = coreErrs.DialError{Message: "from remote: " + msg}

@@ -108,10 +108,7 @@ func (s *session) newStream(addr string) (*stream, error) {
 			return nil, err
 		}
 	} else {
-		if _, err := writeFrame(s, syn); err != nil {
-			return nil, err
-		}
-		if _, err := writeFrame(s, initialData); err != nil {
+		if _, err := writeFrames(s, syn, initialData); err != nil {
 			return nil, err
 		}
 	}

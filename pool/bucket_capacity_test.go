@@ -5,8 +5,9 @@ import (
 	"testing"
 )
 
-// TestPool_Get_Bug 测试 pool.Get 对于 2 的幂次的问题
-func TestPool_Get_Bug(t *testing.T) {
+// TestPoolGetPowerOfTwoCapacity verifies that Get returns a buffer whose
+// capacity satisfies both power-of-two and non-power-of-two requests.
+func TestPoolGetPowerOfTwoCapacity(t *testing.T) {
 	fmt.Println("=== Testing pool.Get for powers of 2 ===")
 	fmt.Println()
 
@@ -16,7 +17,7 @@ func TestPool_Get_Bug(t *testing.T) {
 		description    string
 	}{
 		{1024, 1024, "1024 bytes (power of 2)"},
-		{2048, 2048, "2048 bytes (power of 2) - LIKELY BUG"},
+		{2048, 2048, "2048 bytes (power of 2)"},
 		{4096, 4096, "4096 bytes (power of 2)"},
 		{1025, 2048, "1025 bytes (not power of 2)"},
 		{2049, 4096, "2049 bytes (not power of 2)"},
@@ -70,7 +71,7 @@ func TestPutNonPowerOf2Cap(t *testing.T) {
 	Put(small)
 }
 
-func TestGetBucketCapacityBug(t *testing.T) {
+func TestPoolGetBucketCapacity(t *testing.T) {
 	testCases := []struct {
 		size        int
 		expectedCap int

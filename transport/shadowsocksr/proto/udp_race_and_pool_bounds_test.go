@@ -1,8 +1,8 @@
 //go:build race
 // +build race
 
-// 验证 outbound 网络代码审查中发现的问题
-// 使用 -race 标志运行: go test -race -v -run TestIssueValidation
+// 并发写入与缓冲池边界测试。
+// 使用 -race 标志运行: go test -race -v ./transport/shadowsocksr/proto
 package proto
 
 import (
@@ -20,7 +20,7 @@ import (
 )
 
 // ========================================
-// 问题 1: shadowsockr UDP 并发写入验证
+// ShadowsocksR UDP 并发写入验证
 // ========================================
 
 // MockProtocol 模拟 Protocol 接口
@@ -94,15 +94,15 @@ func (m *MockPacketConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// SimulateShadowsockrPacketConn 模拟 shadowsockr 的 PacketConn（没有写锁）
-type SimulateShadowsockrPacketConn struct {
+// UnlockedShadowsockrPacketConn 模拟无写锁保护的 shadowsockr PacketConn
+type UnlockedShadowsockrPacketConn struct {
 	inner    *MockPacketConn
 	protocol *MockProtocol
 	tgt      string
 	// 注意：这里没有 writeMu
 }
 
-func (c *SimulateShadowsockrPacketConn) WriteTo(b []byte, to string) (int, error) {
+func (c *UnlockedShadowsockrPacketConn) WriteTo(b []byte, to string) (int, error) {
 	// 模拟 shadowsockr 的 WriteTo 逻辑（没有写锁）
 	addr, err := socks.ParseAddr(to)
 	if err != nil {
@@ -132,15 +132,15 @@ func (c *SimulateShadowsockrPacketConn) WriteTo(b []byte, to string) (int, error
 	return len(b), nil
 }
 
-// FixedShadowsockrPacketConn 修复后的 shadowsockr PacketConn（有写锁）
-type FixedShadowsockrPacketConn struct {
+// LockedShadowsockrPacketConn 带写锁保护的 shadowsockr PacketConn
+type LockedShadowsockrPacketConn struct {
 	inner    *MockPacketConn
 	protocol *MockProtocol
 	tgt      string
 	writeMu  sync.Mutex // 添加写锁
 }
 
-func (c *FixedShadowsockrPacketConn) WriteTo(b []byte, to string) (int, error) {
+func (c *LockedShadowsockrPacketConn) WriteTo(b []byte, to string) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
@@ -168,16 +168,16 @@ func (c *FixedShadowsockrPacketConn) WriteTo(b []byte, to string) (int, error) {
 	return len(b), nil
 }
 
-// TestIssue1_Outbound_ShadowsockrUDPRace 验证问题 1: shadowsockr UDP 并发写入
-func TestIssue1_Outbound_ShadowsockrUDPRace(t *testing.T) {
-	t.Log("🔍 验证问题 1: shadowsockr UDP 并发写入 (outbound)")
+// TestShadowsockrUDPConcurrentWrite 验证 shadowsockr UDP 并发写入行为
+func TestShadowsockrUDPConcurrentWrite(t *testing.T) {
+	t.Log("验证 shadowsockr UDP 并发写入")
 
 	// 测试没有锁的情况
 	t.Run("WithoutLock", func(t *testing.T) {
 		inner := &MockPacketConn{}
 		protocol := &MockProtocol{}
 
-		conn := &SimulateShadowsockrPacketConn{
+		conn := &UnlockedShadowsockrPacketConn{
 			inner:    inner,
 			protocol: protocol,
 			tgt:      "127.0.0.1:8080",
@@ -228,7 +228,7 @@ func TestIssue1_Outbound_ShadowsockrUDPRace(t *testing.T) {
 		inner := &MockPacketConn{}
 		protocol := &MockProtocol{}
 
-		conn := &FixedShadowsockrPacketConn{
+		conn := &LockedShadowsockrPacketConn{
 			inner:    inner,
 			protocol: protocol,
 			tgt:      "127.0.0.1:8080",
@@ -270,11 +270,11 @@ func TestIssue1_Outbound_ShadowsockrUDPRace(t *testing.T) {
 }
 
 // ========================================
-// 问题 2: directPacketConn 懒缓存竞争验证
+// directPacketConn 懒缓存并发写入验证
 // ========================================
 
-// SimulateDirectPacketConn 模拟 directPacketConn（没有写锁）
-type SimulateDirectPacketConn struct {
+// UnlockedDirectPacketConn 模拟无写锁保护的 directPacketConn
+type UnlockedDirectPacketConn struct {
 	conn          *net.UDPConn
 	cachedDialTgt atomic.Pointer[netip.AddrPort]
 	cacheOnce     atomic.Bool // 简化版，实际使用 sync.Once
@@ -282,7 +282,7 @@ type SimulateDirectPacketConn struct {
 	FullCone      bool
 }
 
-func (c *SimulateDirectPacketConn) resolveTarget() error {
+func (c *UnlockedDirectPacketConn) resolveTarget() error {
 	// 模拟解析延迟
 	time.Sleep(10 * time.Millisecond)
 
@@ -291,7 +291,7 @@ func (c *SimulateDirectPacketConn) resolveTarget() error {
 	return nil
 }
 
-func (c *SimulateDirectPacketConn) Write(b []byte) (int, error) {
+func (c *UnlockedDirectPacketConn) Write(b []byte) (int, error) {
 	if !c.FullCone {
 		return c.conn.Write(b)
 	}
@@ -315,8 +315,8 @@ func (c *SimulateDirectPacketConn) Write(b []byte) (int, error) {
 	return c.conn.WriteToUDPAddrPort(b, *cached)
 }
 
-// FixedDirectPacketConn 修复后的 directPacketConn（有写锁）
-type FixedDirectPacketConn struct {
+// LockedDirectPacketConn 带写锁保护的 directPacketConn
+type LockedDirectPacketConn struct {
 	conn          *net.UDPConn
 	cachedDialTgt atomic.Pointer[netip.AddrPort]
 	resolveOnce   sync.Once
@@ -326,7 +326,7 @@ type FixedDirectPacketConn struct {
 	writeMu       sync.Mutex
 }
 
-func (c *FixedDirectPacketConn) resolveTarget() error {
+func (c *LockedDirectPacketConn) resolveTarget() error {
 	c.resolveOnce.Do(func() {
 		time.Sleep(10 * time.Millisecond)
 		target := netip.MustParseAddrPort(c.dialTgt)
@@ -335,7 +335,7 @@ func (c *FixedDirectPacketConn) resolveTarget() error {
 	return c.resolveErr
 }
 
-func (c *FixedDirectPacketConn) Write(b []byte) (int, error) {
+func (c *LockedDirectPacketConn) Write(b []byte) (int, error) {
 	if !c.FullCone {
 		return c.conn.Write(b)
 	}
@@ -353,9 +353,9 @@ func (c *FixedDirectPacketConn) Write(b []byte) (int, error) {
 	return c.conn.WriteToUDPAddrPort(b, *cached)
 }
 
-// TestIssue2_Outbound_DirectPacketConnLazyCache 验证问题 2: directPacketConn 懒缓存竞争
-func TestIssue2_Outbound_DirectPacketConnLazyCache(t *testing.T) {
-	t.Log("🔍 验证问题 2: directPacketConn 懒缓存竞争 (outbound)")
+// TestDirectPacketConnLazyCacheConcurrentWrite 验证 directPacketConn 懒缓存并发写入
+func TestDirectPacketConnLazyCacheConcurrentWrite(t *testing.T) {
+	t.Log("验证 directPacketConn 懒缓存并发写入")
 
 	// 创建真实的 UDP 连接
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -366,7 +366,7 @@ func TestIssue2_Outbound_DirectPacketConnLazyCache(t *testing.T) {
 
 	// 测试没有锁的情况
 	t.Run("WithoutLock", func(t *testing.T) {
-		directConn := &SimulateDirectPacketConn{
+		directConn := &UnlockedDirectPacketConn{
 			conn:     conn,
 			dialTgt:  "127.0.0.1:8080",
 			FullCone: true,
@@ -402,7 +402,7 @@ func TestIssue2_Outbound_DirectPacketConnLazyCache(t *testing.T) {
 
 	// 测试有锁的情况
 	t.Run("WithLock", func(t *testing.T) {
-		directConn := &FixedDirectPacketConn{
+		directConn := &LockedDirectPacketConn{
 			conn:     conn,
 			dialTgt:  "127.0.0.1:8080",
 			FullCone: true,
@@ -437,12 +437,12 @@ func TestIssue2_Outbound_DirectPacketConnLazyCache(t *testing.T) {
 }
 
 // ========================================
-// 问题 7: Pool.Put 边界检查验证
+// Pool.Put 边界检查验证
 // ========================================
 
-// TestIssue7_Outbound_PoolPutBoundary 验证问题 7: Pool.Put 边界检查
-func TestIssue7_Outbound_PoolPutBoundary(t *testing.T) {
-	t.Log("🔍 验证问题 7: Pool.Put 边界检查 (outbound)")
+// TestPoolPutCapacityBoundary 验证 Pool.Put 容量边界检查
+func TestPoolPutCapacityBoundary(t *testing.T) {
+	t.Log("验证 Pool.Put 容量边界检查")
 
 	testCases := []struct {
 		name         string
@@ -499,7 +499,7 @@ func TestOutboundLockVsNoLock(t *testing.T) {
 
 	t.Run("WithoutLock", func(t *testing.T) {
 		inner := &MockPacketConn{}
-		conn := &SimulateShadowsockrPacketConn{
+		conn := &UnlockedShadowsockrPacketConn{
 			inner:    inner,
 			protocol: protocol,
 			tgt:      "127.0.0.1:8080",
@@ -528,7 +528,7 @@ func TestOutboundLockVsNoLock(t *testing.T) {
 
 	t.Run("WithLock", func(t *testing.T) {
 		inner := &MockPacketConn{}
-		conn := &FixedShadowsockrPacketConn{
+		conn := &LockedShadowsockrPacketConn{
 			inner:    inner,
 			protocol: protocol,
 			tgt:      "127.0.0.1:8080",

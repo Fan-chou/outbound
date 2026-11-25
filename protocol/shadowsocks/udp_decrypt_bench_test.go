@@ -11,10 +11,10 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// standardDecryptUDP is an exact replica of the pre-optimization DecryptUDPFromPool
-// (hkdf.New + io.ReadFull key schedule), used only for same-process A/B against
-// the current inline deriveSubKey version. Not wired into production.
-func standardDecryptUDP(key *Key, shadowBytes pool.PB, reusedInfo []byte) (pool.PB, error) {
+// hkdfReaderDecryptUDP decrypts a UDP packet using hkdf.New + io.ReadFull
+// rather than inline deriveSubKey, providing a reference baseline for
+// DecryptUDPFromPool benchmarks. Not wired into production.
+func hkdfReaderDecryptUDP(key *Key, shadowBytes pool.PB, reusedInfo []byte) (pool.PB, error) {
 	conf := key.CipherConf
 	buf := pool.Get(len(shadowBytes))
 	if buf.HeadOverlap(shadowBytes) {
@@ -40,7 +40,7 @@ func standardDecryptUDP(key *Key, shadowBytes pool.PB, reusedInfo []byte) (pool.
 	return pool.PB(out), nil
 }
 
-func udpABKey(b *testing.B, payloadSize int) (*Key, pool.PB, []byte) {
+func newUDPDecryptBenchFixture(b *testing.B, payloadSize int) (*Key, pool.PB, []byte) {
 	b.Helper()
 	conf := ciphers.AeadCiphersConf["chacha20-ietf-poly1305"]
 	masterKey := make([]byte, conf.KeyLen)
@@ -58,14 +58,14 @@ func udpABKey(b *testing.B, payloadSize int) (*Key, pool.PB, []byte) {
 	return key, encrypted, info
 }
 
-// BenchmarkUDPDecrypt_Standard is the pre-optimization full UDP decrypt path.
-func BenchmarkUDPDecrypt_Standard(b *testing.B) {
-	key, encrypted, info := udpABKey(b, 1400)
+// BenchmarkUDPDecrypt_HKDFReader benchmarks UDP decryption using hkdf.New + io.ReadFull.
+func BenchmarkUDPDecrypt_HKDFReader(b *testing.B) {
+	key, encrypted, info := newUDPDecryptBenchFixture(b, 1400)
 	defer encrypted.Put()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dec, err := standardDecryptUDP(key, encrypted, info)
+		dec, err := hkdfReaderDecryptUDP(key, encrypted, info)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -73,9 +73,9 @@ func BenchmarkUDPDecrypt_Standard(b *testing.B) {
 	}
 }
 
-// BenchmarkUDPDecrypt_Inline is the current (deriveSubKey) full UDP decrypt path.
-func BenchmarkUDPDecrypt_Inline(b *testing.B) {
-	key, encrypted, info := udpABKey(b, 1400)
+// BenchmarkUDPDecrypt_InlineKeySchedule benchmarks DecryptUDPFromPool with inline deriveSubKey.
+func BenchmarkUDPDecrypt_InlineKeySchedule(b *testing.B) {
+	key, encrypted, info := newUDPDecryptBenchFixture(b, 1400)
 	defer encrypted.Put()
 	b.ReportAllocs()
 	b.ResetTimer()

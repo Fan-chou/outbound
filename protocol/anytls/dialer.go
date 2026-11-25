@@ -84,6 +84,13 @@ func (d *Dialer) UnwrapDialer() netproxy.Dialer {
 	return d.nextDialer
 }
 
+// PinsUDPSessionTarget reports true because AnyTLS UDP-over-TCP v2 opens each
+// logical packet stream in connected mode (command byte 1), fixing the remote
+// UDP target on the server for the stream's lifetime.
+func (d *Dialer) PinsUDPSessionTarget() bool {
+	return true
+}
+
 // sessionIdle returns whether the caller should close the idle session.
 // Callers hold no session locks; connection teardown happens after this returns.
 func (d *Dialer) sessionIdle(s *session) bool {

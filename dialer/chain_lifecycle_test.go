@@ -11,6 +11,7 @@ import (
 
 	"github.com/daeuniverse/outbound/dialer"
 	anytlslink "github.com/daeuniverse/outbound/dialer/anytls"
+	_ "github.com/daeuniverse/outbound/dialer/hysteria2"
 	_ "github.com/daeuniverse/outbound/dialer/juicity"
 	_ "github.com/daeuniverse/outbound/dialer/shadowsocks"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -483,5 +484,37 @@ func TestLinkChainNoopOwnedLayerClosesOnce(t *testing.T) {
 	}
 	if got := base.closes.Load(); got != 0 {
 		t.Fatalf("borrowed_base_closes=%d, want 0", got)
+	}
+}
+
+func TestLinkChainUDPSessionTargetPinner(t *testing.T) {
+	base := &chainBaseDialer{}
+	dAnyTLS, _, err := dialer.NewNetproxyDialerFromLink(base, &dialer.ExtraOption{}, "anytls://pass@127.0.0.1:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dAnyTLS.(io.Closer).Close() }()
+	if !netproxy.PinsUDPSessionTarget(dAnyTLS) {
+		t.Fatal("single-hop anytls should pin UDP session target")
+	}
+
+	// Exit hop is AnyTLS (links[0]) over Shadowsocks entry hop -> true.
+	dExitAnyTLS, _, err := dialer.NewNetproxyDialerFromLink(base, &dialer.ExtraOption{}, "anytls://pass@127.0.0.1:443->ss://aes-128-gcm:pass@127.0.0.2:8388")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dExitAnyTLS.(io.Closer).Close() }()
+	if !netproxy.PinsUDPSessionTarget(dExitAnyTLS) {
+		t.Fatal("anytls->ss exit hop should pin UDP session target")
+	}
+
+	// Exit hop is Hysteria2 (links[0]) over AnyTLS entry hop -> false.
+	dExitHy2, _, err := dialer.NewNetproxyDialerFromLink(base, &dialer.ExtraOption{}, "hysteria2://pass@127.0.0.1:443->anytls://pass@127.0.0.2:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dExitHy2.(io.Closer).Close() }()
+	if netproxy.PinsUDPSessionTarget(dExitHy2) {
+		t.Fatal("hysteria2->anytls must not inherit inner anytls UDP target pinning")
 	}
 }

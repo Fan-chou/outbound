@@ -126,6 +126,16 @@ func (d *ownedChainDialer) Close() error {
 	return d.closeErr
 }
 
+// PinsUDPSessionTarget delegates strictly to the exit hop (d.Dialer) so
+// multi-hop chains preserve the exit protocol's UDP target pinning semantics
+// without leaking an inner tunnel's capability.
+func (d *ownedChainDialer) PinsUDPSessionTarget() bool {
+	if d == nil {
+		return false
+	}
+	return netproxy.PinsUDPSessionTarget(d.Dialer)
+}
+
 func closeDialerLayers(owned []io.Closer) error {
 	var err error
 	for i := len(owned) - 1; i >= 0; i-- {

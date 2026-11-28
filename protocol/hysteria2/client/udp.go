@@ -65,6 +65,9 @@ type udpConn struct {
 	writeLocked          atomic.Bool
 	transportObservation func() (uint64, string)
 	pendingDatagrams     func() int // immutable after session creation
+	maxDatagramLen       func() int // immutable after session creation
+	cachedMaxDataLen     atomic.Int64
+	cachedMaxDataLenAt   atomic.Int64
 	writeMu              sync.Mutex
 	receiveMu            sync.Mutex
 	// deliverMu serializes RegisterPacketReceiver's drain against feed's
@@ -89,6 +92,47 @@ type udpConn struct {
 }
 
 var _ netproxy.PacketReceiver = (*udpConn)(nil)
+var _ netproxy.PacketUnfragmentedPayloadSizer = (*udpConn)(nil)
+
+const cachedMaxDataLenRefreshInterval = 30 * time.Second
+
+func (u *udpConn) currentMaxDatagramLen() int {
+	if u.maxDatagramLen != nil {
+		if n := u.maxDatagramLen(); n > 0 {
+			return n
+		}
+	}
+	cached := int(u.cachedMaxDataLen.Load())
+	if cached <= 0 {
+		return 0
+	}
+	if at := u.cachedMaxDataLenAt.Load(); at > 0 && time.Now().UnixNano()-at > int64(cachedMaxDataLenRefreshInterval) {
+		return 0
+	}
+	return cached
+}
+
+// MaxUnfragmentedPayload reports the largest inner UDP payload for addr that
+// fits inside a single Hysteria2 QUIC datagram without fragmentation.
+func (u *udpConn) MaxUnfragmentedPayload(addr string) int {
+	if u == nil || u.closed.Load() {
+		return 0
+	}
+	maxDataLen := u.currentMaxDatagramLen()
+	if maxDataLen <= 0 {
+		return 0
+	}
+	if addr == "" {
+		addr = u.target
+	}
+	// UDPMessage header overhead (with empty Data): SessionID(4) + PacketID(2) +
+	// FragID(1) + FragCount(1) + varint(len(addr)) + len(addr).
+	hdr := (&protocol.UDPMessage{Addr: []byte(addr)}).Size()
+	if maxDataLen <= hdr {
+		return 0
+	}
+	return maxDataLen - hdr
+}
 
 // TransportDone implements netproxy.TransportLifecycle.
 // The returned channel is closed when the QUIC transport backing this
@@ -311,34 +355,44 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 		Addr:      u.addrBytesForWrite(addr),
 		Data:      b,
 	}
-	// The session's fixed serialization buffer is smaller than the theoretical
-	// UDP payload limit. Treat local buffer exhaustion the same way quic-go
-	// reports path MTU exhaustion so we fragment instead of silently dropping.
-	if msg.Size() > len(u.SendBuf) {
-		err = &quic.DatagramTooLargeError{MaxDataLen: int64(len(u.SendBuf))}
+	// Fast-path fragmentation when the outer QUIC datagram limit is already
+	// known, avoiding a doomed full serialization, SendFunc call, and
+	// DatagramTooLargeError allocation on every oversized packet.
+	msgSize := msg.Size()
+	fragLimit := 0
+	if msgSize > len(u.SendBuf) {
+		fragLimit = len(u.SendBuf)
+	} else if knownMax := u.currentMaxDatagramLen(); knownMax > 0 && msgSize > knownMax {
+		fragLimit = knownMax
 	} else {
 		err = u.SendFunc(ctx, u.SendBuf, msg)
-	}
-	var errTooLarge *quic.DatagramTooLargeError
-	if errors.As(err, &errTooLarge) {
-		// Message too large, try fragmentation
-		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
-		fMsgs, fragErr := frag.FragUDPMessage(msg, int(errTooLarge.MaxDataLen))
-		if fragErr != nil {
-			return 0, coreErrs.ProtocolError{Message: fragErr.Error()}
+		if err == nil {
+			return len(b), nil
 		}
-		udpFragmentedPackets.Add(1)
-		for _, fMsg := range fMsgs {
-			udpFragmentAttempts.Add(1)
-			err := u.SendFunc(ctx, u.SendBuf, &fMsg)
-			if err != nil {
-				return 0, err
-			}
+		var errTooLarge *quic.DatagramTooLargeError
+		if !errors.As(err, &errTooLarge) {
+			return len(b), err
 		}
-		return len(b), nil
-	} else {
-		return len(b), err
+		if errTooLarge.MaxDataLen > 0 {
+			u.cachedMaxDataLen.Store(errTooLarge.MaxDataLen)
+			u.cachedMaxDataLenAt.Store(time.Now().UnixNano())
+		}
+		fragLimit = int(errTooLarge.MaxDataLen)
 	}
+	// Message too large, fragment directly to fragLimit.
+	msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
+	fMsgs, fragErr := frag.FragUDPMessage(msg, fragLimit)
+	if fragErr != nil {
+		return 0, coreErrs.ProtocolError{Message: fragErr.Error()}
+	}
+	udpFragmentedPackets.Add(1)
+	for _, fMsg := range fMsgs {
+		udpFragmentAttempts.Add(1)
+		if err := u.SendFunc(ctx, u.SendBuf, &fMsg); err != nil {
+			return 0, err
+		}
+	}
+	return len(b), nil
 }
 
 func (u *udpConn) Close() error {
@@ -605,6 +659,9 @@ func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netp
 	}
 	if observer, ok := m.io.(interface{ DatagramSendObservation() (uint64, string) }); ok {
 		conn.transportObservation = observer.DatagramSendObservation
+	}
+	if sizer, ok := m.io.(interface{ MaxDatagramPayloadSize() int }); ok {
+		conn.maxDatagramLen = sizer.MaxDatagramPayloadSize
 	}
 	conn.CloseFunc = func() {
 		m.close(conn)

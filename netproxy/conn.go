@@ -73,6 +73,15 @@ type PacketBatchWriter interface {
 	WriteBatch(items []BatchItem) (n int, err error)
 }
 
+// PacketUnfragmentedPayloadSizer is an optional extension of PacketConn for
+// encapsulated datagram transports (such as Hysteria2) that know the maximum
+// inner UDP payload length for addr that fits inside a single outer datagram
+// without application-layer fragmentation. A non-positive return value means
+// the bound is currently unknown or not applicable.
+type PacketUnfragmentedPayloadSizer interface {
+	MaxUnfragmentedPayload(addr string) int
+}
+
 // ReceivedPacket is one complete datagram delivered by an optional
 // transport-owned packet receiver. The receiver owns the packet after a
 // handler accepts it and must call Release exactly once.

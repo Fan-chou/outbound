@@ -798,3 +798,10 @@ func (io *udpIOImpl) DatagramSendObservation() (uint64, string) {
 	}
 	return 0, ""
 }
+
+func (io *udpIOImpl) MaxDatagramPayloadSize() int {
+	if conn, ok := io.Conn.(interface{ MaxDatagramPayloadSize() int }); ok {
+		return conn.MaxDatagramPayloadSize()
+	}
+	return 0
+}
